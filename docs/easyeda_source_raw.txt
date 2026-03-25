@@ -1,0 +1,2 @@
+{"type":"DOCHEAD"}||{"docType":"SCH_PAGE","client":"d81da101ffe7890f","uuid":"b6e9ac82c7f3e894","updateTime":1774331394606,"version":"1774331394606"}|
+{"type":"CANVAS","ticket":1,"id":"CANVAS"}||{"originX":0,"originY":0}|
