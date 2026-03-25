@@ -656,17 +656,64 @@ Boot 时 PIN_CNF 寄存器复位值 = 0x00000002：方向=输入，输入缓冲=
 
 选 P0.13 没有硬件上的强制原因——任何普通 GPIO 都能驱动 P-FET 栅极。P0.13 是 nice!nano 确立的事实标准，后续兼容板沿用。
 
+### nice!nano v1→v2 极性变化：从 P-FET 控制到 LDO CE 控制
+
+v1 和 v2 的 active level 从 LOW 变成 HIGH，原因不是加了反相器，而是**控制点从 P-FET 栅极换成了 LDO CE（使能）引脚**。
+
+**nice!nano v1 拓扑（GPIO_ACTIVE_LOW）：**
+
+```
+VDDH ─── P-FET (DMP2088LCP3) ─── LDO (AP2112K) ─── EXTVCC
+  Source     ↑ Gate                  EN 接 VIN (永远使能)
+             │
+         P0.13 (POWER_PIN)
+```
+
+- P0.13 LOW → P-FET 栅极 LOW → Vgs 很负 → P-FET 导通 → LDO 有 VIN → EXTVCC ON
+- P0.13 HIGH → P-FET 关断 → LDO 断电 → EXTVCC OFF
+- **控制逻辑：LOW = 开，HIGH = 关 → ACTIVE_LOW**
+
+**nice!nano v2 / SuperMini 拓扑（GPIO_ACTIVE_HIGH）：**
+
+```
+VDDH ─── LDO (XC6220/ME6217) ─── EXTVCC
+           ↑ CE (使能，active HIGH)
+           │
+       R4 (10M 上拉到 VDDH)
+           │
+       P0.13 (POWER_PIN)
+```
+
+- P0.13 HIGH → CE HIGH → LDO 使能 → EXTVCC ON
+- P0.13 LOW → CE LOW → LDO 关闭 → EXTVCC OFF（此时 VDDH 通过 R4 漏电到 GND）
+- **控制逻辑：HIGH = 开，LOW = 关 → ACTIVE_HIGH**
+- **P-FET 不再出现在 EXTVCC 通路中**（SuperMini 的 AO3401A 用于 USB/电池供电切换）
+
+**为什么改？**
+
+| | v1 (P-FET 方案) | v2 (LDO CE 方案) |
+|---|---|---|
+| 元器件 | P-FET + LDO（EN 常开） | 仅 LDO（CE 可控） |
+| BOM 数量 | 多一颗 MOSFET | 少一颗 |
+| 关断漏电 | P-FET 完全断开 VIN，≈0μA | LDO 自身 shutdown 电流 ~0.1μA |
+| 压降 | P-FET Rds_on 损耗 (~50mΩ) | 无 FET 压降 |
+| 上拉电阻 | 不需要（或在栅极） | 需要（CE 上拉保证 boot 时默认开启） |
+
+v2 方案更简洁：新一代 LDO（XC6220 shutdown <1μA，ME6217 shutdown ~0.1μA）的关断电流足够低，不再需要用 P-FET 彻底切断供电。
+
+> SuperMini 的 R4（10M 上拉）和 5.6K 漏电问题也由此解释：R4 连接在 LDO CE 和 VDDH 之间。P0.13 拉低关闭 LDO 时，电流从 VDDH 通过 R4 流向 GND。5.6K 时 3.6V/5.6K = 643μA；换 10M 后 3.6V/10M = 0.36μA。
+
 ### 各板子电源控制引脚对比
 
-| 板子 | Power Pin | Active Level | 备注 |
-|------|-----------|-------------|------|
-| **nice!nano v1** | P0.13 | LOW | 原始设计 |
-| **nice!nano v2** | P0.13 | HIGH | v2 改了极性 |
-| **SuperMini** | P0.13 | HIGH | 兼容 nice!nano v2 |
+| 板子 | Power Pin | Active Level | 控制方式 |
+|------|-----------|-------------|---------|
+| **nice!nano v1** | P0.13 | LOW | P-FET 栅极 |
+| **nice!nano v2** | P0.13 | HIGH | LDO CE 引脚 |
+| **SuperMini** | P0.13 | HIGH | LDO CE (ME6217) |
 | **Mikoto** | P0.13 | HIGH | |
 | **52840nano V2** | P0.13 | HIGH | |
 | **Kinesis Adv360 Pro** | P0.13 | HIGH | |
-| **nrfmicro** (全系列) | P1.09 | LOW | joric 原始设计 |
+| **nrfmicro** (全系列) | P1.09 | LOW | P-FET 栅极 |
 | **Puchi-BLE** | P1.09 | LOW | 沿用 nrfmicro |
 | **BlueMicro840** | P0.12 | HIGH | |
 | **Pillbug** | P1.07 | LOW | |
@@ -674,7 +721,7 @@ Boot 时 PIN_CNF 寄存器复位值 = 0x00000002：方向=输入，输入缓冲=
 | **XIAO BLE** | P0.14 | LOW | open-drain 模式 |
 | **Glove80 LH / RH** | P0.31 / P0.19 | HIGH | 左右手不同引脚 |
 
-> P0.13 是最流行的选择，nice!nano v1→v2 的 active level 从 LOW 改成 HIGH，说明 P-FET 驱动电路做了调整（可能加了 N-FET 反相驱动）。
+> P0.13 是最流行的选择。ACTIVE_LOW 的板子多用 P-FET 方案，ACTIVE_HIGH 的板子多用 LDO CE 方案。
 
 ## Troubleshooting
 
