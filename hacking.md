@@ -18,6 +18,7 @@ This guide covers using a J-Link debugger to interact with nRF52840 via SWD on m
 - [SuperMini NRF52840 上拉电阻问题](#supermini-nrf52840-上拉电阻问题)
 - [nRF52840 封装对比: aQFN73 vs QFN48](#nrf52840-封装对比-aqfn73-vs-qfn48)
 - [电源控制 (EXT_POWER) 架构](#电源控制-ext_power-架构)
+- [BLE 键盘功耗与续航估算](#ble-键盘功耗与续航估算)
 - [Troubleshooting](#troubleshooting)
 
 ## Hardware Setup
@@ -722,6 +723,73 @@ v2 方案更简洁：新一代 LDO（XC6220 shutdown <1μA，ME6217 shutdown ~0.
 | **Glove80 LH / RH** | P0.31 / P0.19 | HIGH | 左右手不同引脚 |
 
 > P0.13 是最流行的选择。ACTIVE_LOW 的板子多用 P-FET 方案，ACTIVE_HIGH 的板子多用 LDO CE 方案。
+
+## BLE 键盘功耗与续航估算
+
+> 数据来源: nRF52840 Product Specification v1.7, Section 5.2 Current consumption
+
+### nRF52840 各状态功耗（DC-DC 模式，3V 供电，25°C）
+
+| 状态 | 电流 | 说明 |
+|------|------|------|
+| **System OFF** | 0.40 μA | 无 RAM 保持，仅 reset 唤醒 |
+| **System ON 深睡眠** | 1.29 μA | VDDH 供电，无 RAM，REGO=3.3V，任意事件唤醒 |
+| **System ON 深睡眠 + RAM** | 2.35 μA | 全 256KB RAM 保持，任意事件唤醒 |
+| **System ON + RTC** | 3.16 μA | 全 RAM + RTC（LFRC 时钟），用于定时唤醒 |
+| **CPU 运行** | 3.3 mA | 64MHz，DC-DC，从 flash 执行 |
+| **BLE TX 0dBm** | 6.40 mA | 1 Mbps BLE，DC-DC |
+| **BLE RX** | 6.26 mA | 1 Mbps BLE，DC-DC |
+| **BLE TX 8dBm** | 16.40 mA | 最大功率发射 |
+
+### BLE 键盘各工作模式估算
+
+假设条件：EXT_POWER 关闭（无 RGB LED/OLED），使用外部 32K 晶振（LFXO），DC-DC 模式。
+
+| 工作模式 | 平均电流 | 计算依据 |
+|----------|----------|----------|
+| **深睡眠**（无 BLE 连接） | ~3-5 μA | MCU System ON + RAM + RTC + 外围漏电 |
+| **空闲已连接**（BLE 保持，无按键） | ~100-200 μA | 连接间隔 75ms，每次射频 ~1.5ms，6.3mA × 1.5/75 ≈ 126 μA + 基础 3μA |
+| **打字中**（BLE 低延迟） | ~2-3 mA | 连接间隔 7.5-15ms，矩阵扫描 + CPU 处理 + 射频 |
+| **RGB LED 开启** | +20-100 mA | 取决于 LED 数量和亮度（WS2812 每颗静态漏电 ~1mA） |
+| **OLED 显示** | +10-20 mA | SSD1306 128x32 典型 |
+
+> ZMK 固件在无按键操作一段时间后，会自动从「打字中」→「空闲已连接」→「深睡眠」逐级降低功耗。
+
+### 每日功耗模型
+
+典型使用场景：每天打字 3 小时，待机连接 5 小时，深睡眠 16 小时（EXT_POWER 关闭）。
+
+```
+每日消耗 = 3h × 2.5mA + 5h × 0.15mA + 16h × 0.005mA
+         = 7.50 + 0.75 + 0.08
+         = 8.33 mAh/天
+```
+
+### 常见电池续航估算
+
+| 电池型号 | 容量 | 常见用途 | 估算续航 |
+|----------|------|----------|----------|
+| 301220 | 60 mAh | 极小分体键盘 | ~7 天 |
+| 301230 | 110 mAh | 小型分体（Corne 单手） | ~13 天 |
+| 401230 | 130 mAh | nice!nano 标配 | ~16 天 |
+| 502030 | 250 mAh | 中型分体键盘 | ~30 天 |
+| 503035 | 500 mAh | 一体式 60% 键盘 | ~60 天 |
+| 603450 | 1000 mAh | 大型一体式键盘 | ~120 天 |
+| 704060 | 2000 mAh | 带触摸屏/大型设备 | ~240 天 |
+
+> 以上估算假设 EXT_POWER 关闭（无 RGB/OLED），实际续航受使用强度、BLE 连接参数、外设功耗影响很大。如果 RGB LED 常亮（~50mA），110mAh 电池只能撑 ~2 小时。
+
+### 影响续航的关键因素
+
+| 因素 | 影响 | 建议 |
+|------|------|------|
+| **RGB LED** | 开启时功耗占 90%+ | 不用时关闭 EXT_POWER |
+| **OLED 显示屏** | +10-20 mA | 设置自动熄屏超时 |
+| **BLE 连接间隔** | 7.5ms (低延迟) vs 75ms (省电) | ZMK 自动切换 |
+| **外部 32K 晶振** | LFXO vs LFRC：影响睡眠时校准功耗 | 必须贴外部晶振 |
+| **DC-DC vs LDO** | DC-DC 效率 >80%，LDO ~50% | E73 参考设计已用 DC-DC |
+| **上拉电阻漏电** | SuperMini 旧批次 R4=5.6K 漏 643μA | 确认 R4 ≥ 10M |
+| **EXT_POWER LDO 关断电流** | XC6220 <1μA，ME6217 ~0.1μA | 选低 Iq 的 LDO |
 
 ## Troubleshooting
 
