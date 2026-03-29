@@ -19,6 +19,8 @@ This guide covers using a J-Link debugger to interact with nRF52840 via SWD on m
 - [nRF52840 封装对比: aQFN73 vs QFN48](#nrf52840-封装对比-aqfn73-vs-qfn48)
 - [电源控制 (EXT_POWER) 架构](#电源控制-ext_power-架构)
 - [BLE 键盘功耗与续航估算](#ble-键盘功耗与续航估算)
+- [nRF52840 内置 DC-DC / LDO 与 Zephyr 配置](#nrf52840-内置-dc-dc--ldo-与-zephyr-配置)
+  - [DC-DC 开关纹波对 BLE 射频的影响](#dc-dc-开关纹波对-ble-射频的影响)
 - [Troubleshooting](#troubleshooting)
 
 ## Hardware Setup
@@ -741,23 +743,61 @@ v2 方案更简洁：新一代 LDO（XC6220 shutdown <1μA，ME6217 shutdown ~0.
 | **BLE RX** | 6.26 mA | 1 Mbps BLE，DC-DC |
 | **BLE TX 8dBm** | 16.40 mA | 最大功率发射 |
 
-### BLE 键盘各工作模式估算
+### BLE 键盘各工作模式估算（无背光）
 
-假设条件：EXT_POWER 关闭（无 RGB LED/OLED），使用外部 32K 晶振（LFXO），DC-DC 模式。
+假设条件：背光 LED 关闭，使用外部 32K 晶振（LFXO），DC-DC 模式。
 
 | 工作模式 | 平均电流 | 计算依据 |
 |----------|----------|----------|
 | **深睡眠**（无 BLE 连接） | ~3-5 μA | MCU System ON + RAM + RTC + 外围漏电 |
 | **空闲已连接**（BLE 保持，无按键） | ~100-200 μA | 连接间隔 75ms，每次射频 ~1.5ms，6.3mA × 1.5/75 ≈ 126 μA + 基础 3μA |
 | **打字中**（BLE 低延迟） | ~2-3 mA | 连接间隔 7.5-15ms，矩阵扫描 + CPU 处理 + 射频 |
-| **RGB LED 开启** | +20-100 mA | 取决于 LED 数量和亮度（WS2812 每颗静态漏电 ~1mA） |
-| **OLED 显示** | +10-20 mA | SSD1306 128x32 典型 |
 
 > ZMK 固件在无按键操作一段时间后，会自动从「打字中」→「空闲已连接」→「深睡眠」逐级降低功耗。
 
+### 8 颗背光 LED + 升压驱动功耗分析
+
+键盘背光使用白色 LED（Vf ≈ 3.0-3.2V），锂电池电压 3.0-4.2V 不够直接驱动串联 LED，需要升压 DC-DC LED 驱动芯片。
+
+#### LED 驱动拓扑
+
+```
+电池 3.0~4.2V ─→ Boost LED Driver ─→ 升压到 ~6.4V ─→ LED 串联组
+                        ↑                              │
+                   PWM 调光 (MCU GPIO)            2 串 × 4 并 (2S4P)
+                   EN 使能 (EXT_POWER)            每串 2 颗 LED
+```
+
+**推荐配置：2S4P**（2 颗串联 × 4 路并联）
+- 每串 Vf = 3.2V × 2 = 6.4V
+- 升压芯片输出：~6.8V（含余量）
+- 每路独立限流，通过 PWM 调占空比实现调光
+
+#### 常见升压 LED 驱动 IC
+
+| 芯片 | 输入 | 输出 | 效率 | Iq (工作) | Iq (关断) | 封装 | 备注 |
+|------|------|------|------|-----------|-----------|------|------|
+| TPS61160 | 3.0-5.5V | 最高 27V | ~87% | 25 μA | 1 μA | SOT-23-5 | 经典 LED boost，PWM 调光 |
+| TPS61169 | 2.7-5.5V | 最高 18V | ~85% | 25 μA | 1 μA | SOT-23-5 | 低 EMI 版本 |
+| SGM3140 | 2.5-5.5V | 可调 | ~80% | 10 μA | <1 μA | SOT-23-6 | 超低成本，常用于手电 |
+| LP5907 + 分立 boost | - | - | - | - | - | - | 需更多元件，不推荐 |
+
+#### 8 颗白色 LED 功耗计算
+
+| 亮度等级 | 每颗 LED 电流 | 总 LED 电流 | LED 功耗 | 电池端电流 (η=85%) | 说明 |
+|----------|-------------|-----------|---------|-------------------|------|
+| **全亮** | 20 mA | 160 mA | 6.4V × 80mA × 2串 = 1024 mW | **~33 mA** @3.7V | 室内偏亮，伤眼 |
+| **中亮** | 10 mA | 80 mA | 512 mW | **~16 mA** | 日常使用 |
+| **低亮** | 3 mA | 24 mA | 154 mW | **~5 mA** | 暗光环境 |
+| **微亮** | 1 mA | 8 mA | 51 mW | **~2 mA** | 夜间定位 |
+| **关闭** | 0 | 0 | 0 | **~1 μA** | 驱动 IC shutdown |
+
+> 计算方式：电池端电流 = LED 功耗 / (Vbat × η) = Vout × Iout / (3.7V × 0.85)
+> 注意：2S4P 拓扑中，Iout = 4 路 × 每路电流，Vout ≈ 6.4V
+
 ### 每日功耗模型
 
-典型使用场景：每天打字 3 小时，待机连接 5 小时，深睡眠 16 小时（EXT_POWER 关闭）。
+#### 场景 A：无背光（EXT_POWER 关闭）
 
 ```
 每日消耗 = 3h × 2.5mA + 5h × 0.15mA + 16h × 0.005mA
@@ -765,31 +805,528 @@ v2 方案更简洁：新一代 LDO（XC6220 shutdown <1μA，ME6217 shutdown ~0.
          = 8.33 mAh/天
 ```
 
+#### 场景 B：背光低亮（3mA/LED），打字时开启
+
+```
+每日消耗 = 3h × (2.5 + 5)mA + 5h × 0.15mA + 16h × 0.005mA
+         = 22.50 + 0.75 + 0.08
+         = 23.33 mAh/天
+```
+
+#### 场景 C：背光中亮（10mA/LED），全天开启
+
+```
+每日消耗 = 3h × (2.5 + 16)mA + 5h × (0.15 + 16)mA + 16h × 0.005mA
+         = 55.50 + 80.75 + 0.08
+         = 136.33 mAh/天
+```
+
 ### 常见电池续航估算
 
-| 电池型号 | 容量 | 常见用途 | 估算续航 |
-|----------|------|----------|----------|
-| 301220 | 60 mAh | 极小分体键盘 | ~7 天 |
-| 301230 | 110 mAh | 小型分体（Corne 单手） | ~13 天 |
-| 401230 | 130 mAh | nice!nano 标配 | ~16 天 |
-| 502030 | 250 mAh | 中型分体键盘 | ~30 天 |
-| 503035 | 500 mAh | 一体式 60% 键盘 | ~60 天 |
-| 603450 | 1000 mAh | 大型一体式键盘 | ~120 天 |
-| 704060 | 2000 mAh | 带触摸屏/大型设备 | ~240 天 |
+| 电池型号 | 容量 | 无背光 | 低亮打字时开 | 中亮全天开 |
+|----------|------|--------|------------|----------|
+| 301230 | 110 mAh | ~13 天 | ~5 天 | <1 天 |
+| 401230 | 130 mAh | ~16 天 | ~6 天 | ~1 天 |
+| 502030 | 250 mAh | ~30 天 | ~11 天 | ~2 天 |
+| 503035 | 500 mAh | ~60 天 | ~21 天 | ~4 天 |
+| 603450 | 1000 mAh | ~120 天 | ~43 天 | ~7 天 |
+| 704060 | 2000 mAh | ~240 天 | ~86 天 | ~15 天 |
 
-> 以上估算假设 EXT_POWER 关闭（无 RGB/OLED），实际续航受使用强度、BLE 连接参数、外设功耗影响很大。如果 RGB LED 常亮（~50mA），110mAh 电池只能撑 ~2 小时。
+> **关键结论**：背光 LED 即使只有 8 颗，在中亮以上也会成为功耗主导。建议：
+> - 默认关闭背光，按需开启
+> - 使用 PWM 调光，低亮（1-3mA/LED）足够暗光环境使用
+> - 设置自动熄灭超时（30 秒无操作关背光）
+> - 升压驱动 IC 的 EN 引脚必须接 EXT_POWER，深睡眠时完全关断（<1μA）
 
 ### 影响续航的关键因素
 
 | 因素 | 影响 | 建议 |
 |------|------|------|
-| **RGB LED** | 开启时功耗占 90%+ | 不用时关闭 EXT_POWER |
+| **背光 LED 亮度** | 低亮 ~5mA vs 中亮 ~16mA vs 全亮 ~33mA | PWM 调光 + 自动熄灭超时 |
+| **背光开启时长** | 全天开 vs 仅打字时开 | 设 30s 超时自动关闭 |
+| **升压驱动 IC 关断电流** | 工作 ~25μA vs shutdown ~1μA | EN 接 EXT_POWER |
 | **OLED 显示屏** | +10-20 mA | 设置自动熄屏超时 |
 | **BLE 连接间隔** | 7.5ms (低延迟) vs 75ms (省电) | ZMK 自动切换 |
 | **外部 32K 晶振** | LFXO vs LFRC：影响睡眠时校准功耗 | 必须贴外部晶振 |
 | **DC-DC vs LDO** | DC-DC 效率 >80%，LDO ~50% | E73 参考设计已用 DC-DC |
 | **上拉电阻漏电** | SuperMini 旧批次 R4=5.6K 漏 643μA | 确认 R4 ≥ 10M |
 | **EXT_POWER LDO 关断电流** | XC6220 <1μA，ME6217 ~0.1μA | 选低 Iq 的 LDO |
+
+## nRF52840 内置 DC-DC / LDO 与 Zephyr 配置
+
+### 两级稳压器架构
+
+nRF52840 内部有 **REG0** 和 **REG1** 两级稳压器，每级都可以选择 LDO 或 DC-DC 模式：
+
+```
+锂电池 3.0~4.2V
+  │
+  ▼ VDDH
+┌─────────────────────────────────────┐
+│  REG0 (高压级)                       │
+│  VDDH (2.5-5.5V) → VDD             │
+│  输出电压可配: 1.8/2.1/2.4/2.7/3.0/3.3V │
+│  外供能力: 最大 25mA                 │
+│  控制寄存器: DCDCEN0 (0x40000580)    │
+│  外部电感引脚: DCCH                  │
+└──────────┬──────────────────────────┘
+           ▼ VDD
+┌─────────────────────────────────────┐
+│  REG1 (核心级)                       │
+│  VDD → 1.3V 核心电压                │
+│  输出到 DEC4 引脚                    │
+│  控制寄存器: DCDCEN (0x40000578)     │
+│  外部电感引脚: DCC                   │
+└─────────────────────────────────────┘
+```
+
+### 两种供电模式
+
+| 模式 | 条件 | 使用的稳压器 | 典型场景 |
+|------|------|------------|---------|
+| **Normal Voltage** | VDD 与 VDDH 短接，1.7-3.6V | 仅 REG1 | CR2032 纽扣电池、QFN48 封装 |
+| **High Voltage** | VDDH 2.5-5.5V，VDD 由 REG0 输出 | REG0 + REG1 | **LiPo 电池 (3.7V)**、USB 5V |
+
+> QFN48 封装的 VDD 与 VDDH 内部短接，只能用 Normal Voltage 模式。aQFN73 和 E73 模组支持 High Voltage 模式。
+
+### REG0 输出电压配置（UICR REGOUT0, 地址 0x10001304）
+
+| REGOUT0 值 | 输出电压 | 备注 |
+|-----------|---------|------|
+| 0 | 1.8V | |
+| 1 | 2.1V | |
+| 2 | 2.4V | |
+| 3 | 2.7V | |
+| 4 | 3.0V | |
+| 5 | **3.3V** | 推荐：可同时给外部传感器/LED 供 3.3V |
+| 7 (默认) | 1.8V | 空白芯片默认值 |
+
+> 配置的输出电压不能大于 VDDH - 0.3V（最小压差要求）。
+
+### 为什么 VDD 可以改成 3.3V？什么时候需要改？
+
+#### 片内反馈电阻，寄存器选档
+
+REG0 和 REG1 的反馈网络**全部集成在芯片内部**，不需要外部电阻分压器。这和普通外部 DC-DC（如 TPS63020）不同——那些需要两颗外部电阻设定输出电压。
+
+nRF52840 的做法是：片内有多组反馈电阻，通过 UICR REGOUT0 寄存器选择接入哪组，实现输出电压切换。写寄存器 = 换电阻档位：
+
+```
+UICR REGOUT0 = 7 (默认)  →  片内选通 1.8V 反馈网络  →  VDD = 1.8V
+UICR REGOUT0 = 5          →  片内选通 3.3V 反馈网络  →  VDD = 3.3V
+```
+
+> 修改 UICR 需要先擦除再写入（NVM 操作），且**写入后必须复位才生效**。通常在 bootloader 中完成一次即可。
+
+#### 片内所有电压一览
+
+```
+锂电池 3.7V
+  │
+  ▼ VDDH (2.5-5.5V)
+  │
+  ├─ REG0 ──→ VDD = 1.8V (默认) / 可配为 3.3V
+  │            ↑ 通过 UICR REGOUT0 寄存器选档
+  ▼ VDD
+  │
+  └─ REG1 ──→ DEC4 = 1.3V (固定，不可配置，给 CPU 核心)
+```
+
+| 引脚 | 电压 | 可配置？ | 用途 |
+|------|------|---------|------|
+| VDDH | 2.5-5.5V | 外部输入 | 电池/USB 输入 |
+| **VDD** | **1.8V 默认 / 可改 3.3V** | **是 (REGOUT0)** | MCU I/O 电平 + 外供 |
+| DEC1 | 1.1V | 固定 | 核心逻辑 |
+| DEC2 | 1.3V | 固定 | 射频电路 |
+| **DEC4** | **1.3V** | 固定 | REG1 输出，CPU 核心供电 |
+| DEC5 | 1.3V | 固定 | 射频电路 |
+| DECUSB | 3.3V | 固定 | USB PHY |
+
+> DEC1~DEC5 的电压全部由片内稳压器产生，固定不可调，外部只需接去耦电容。
+
+#### 什么情况需要改成 3.3V？
+
+**核心原因：VDD 同时决定了 GPIO 的输出电平。** nRF52840 的 GPIO 输出高电平 = VDD 电压。
+
+| VDD 电压 | GPIO 输出高电平 | 后果 |
+|---------|---------------|------|
+| 1.8V (默认) | 1.8V | 很多 3.3V 外设的 VIH 阈值 > 1.8V，**通信失败** |
+| **3.3V** | **3.3V** | 兼容绝大部分 3.3V 外设 |
+
+**需要改 3.3V 的场景：**
+
+| 场景 | 原因 |
+|------|------|
+| 外接 3.3V 传感器（加速度计、OLED 等） | I2C/SPI 信号电平必须匹配 |
+| 驱动 WS2812 RGB LED | WS2812 的 VIH > 0.7×VDD，1.8V 信号驱不动 |
+| 外接 SD 卡 | SD 卡标准 3.3V 信号 |
+| 给外部电路从 VDD 引脚取电 | REG0 最大外供 25mA @3.3V |
+| 与 nice!nano 兼容的扩展板配合 | nice!nano 生态默认 VDD = 3.3V |
+
+**可以保持 1.8V 的场景：**
+
+| 场景 | 原因 |
+|------|------|
+| 纯 MCU 运行 + BLE（无外设） | 片内射频不走 VDD |
+| 所有外设都支持 1.8V 电平 | 少数传感器支持（如某些 IMU） |
+| 追求极致低功耗 | 1.8V 时 REG0 效率更高（压差更大，DC-DC 更高效） |
+
+#### nice!nano / SuperMini 的做法
+
+nice_nano bootloader 在初始化时会检查并写入 REGOUT0 = 3.3V：
+
+```c
+// Adafruit nRF52 Bootloader 中的代码
+if ((NRF_UICR->REGOUT0 & UICR_REGOUT0_VOUT_Msk) != UICR_REGOUT0_VOUT_3V3) {
+    NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Wen;
+    while (NRF_NVMC->READY == NVMC_READY_READY_Busy) {}
+    NRF_UICR->REGOUT0 = UICR_REGOUT0_VOUT_3V3;  // 值 = 5
+    NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Ren;
+    NVIC_SystemReset();  // 必须复位才生效
+}
+```
+
+所以如果你用 nice_nano bootloader，VDD 已经是 3.3V 了。但如果用裸芯片从零开始（无 bootloader），第一次上电 VDD = 1.8V，需要在你自己的 bootloader 或固件初始化中配置。
+
+#### 为什么默认不直接是 3.3V？
+
+Nordic 选择 1.8V 作为默认值是因为：
+
+1. **安全**：VDDH 最低 2.5V 时，1.8V 输出有足够压差（0.7V > 0.3V 最小要求），3.3V 输出在 VDDH < 3.6V 时不满足压差要求
+2. **通用**：1.8V 是很多 SoC 的标准 I/O 电压
+3. **省电**：VDD 越低，片内数字电路功耗越低
+
+对于键盘项目（LiPo 3.0-4.2V 供电 + 外接 3.3V 传感器/LED），改成 3.3V 是必须的。
+
+### LDO 与 DC-DC 的启动顺序
+
+芯片上电时**永远先用 LDO**，因为 DCDCEN 寄存器复位值 = 0。这保证了即使 PCB 没焊电感也不会砖化：
+
+```
+上电 → LDO 模式启动（不需要电感）
+  │
+  ▼ 固件运行
+  │
+  ├── 检测到 PCB 有电感 → 写 DCDCEN=1 → 切换到 DC-DC 模式（省电 ~45%）
+  │
+  └── PCB 没焊电感 → 不写 DCDCEN → 继续用 LDO（功耗高但正常工作）
+```
+
+**焊了电感但未启用 DC-DC 时**：电感在 DC 下等于一根导线（阻抗 ≈ 0Ω），对 LDO 工作没有任何影响。电感只有在 DC-DC 的 MHz 级开关频率下才起储能/滤波作用。
+
+**未焊电感但启用了 DC-DC 时**：DC-DC 开关输出没有电感滤波 → 1.3V 核心电压崩溃 → 芯片死机 → 每次上电固件都会再次启用 DC-DC → **砖化**（需要 SWD 擦除救回）。
+
+### DC-DC vs LDO 功耗实测对比
+
+| 场景 | DC-DC | LDO | 节省比例 |
+|------|-------|-----|---------|
+| CPU @64MHz (CoreMark, Flash) | **3.3 mA** | 6.3 mA | **48%** |
+| CPU @64MHz (CoreMark, RAM) | **2.8 mA** | 5.2 mA | **46%** |
+| BLE TX @0dBm, 1Mbps | **6.4 mA** | 10.8 mA | **41%** |
+| BLE TX @8dBm (最大功率) | **16.4 mA** | — | — |
+| BLE RX @1Mbps | **6.26 mA** | 10.1 mA | **38%** |
+| CPU + TX @0dBm 同时 | **8.1 mA** | 15.4 mA | **47%** |
+| CPU + RX 同时 | **8.6 mA** | 16.2 mA | **47%** |
+| CPU 能效 | **52 μA/MHz** | ~98 μA/MHz | **47%** |
+
+**结论：DC-DC 模式在所有活跃场景下都比 LDO 省电约 40-48%，对电池供电的键盘项目是必须的。**
+
+### DC-DC 开关纹波对 BLE 射频的影响
+
+常见疑问：两级 DC-DC 的 PWM 开关纹波会不会干扰 2.4GHz BLE 射频？
+
+**结论：几乎没有可测量的影响。** Nordic 的设计让 DC-DC 和射频同时运行，不需要在射频收发时关闭 DC-DC。
+
+#### 证据：datasheet 不区分 DC-DC/LDO 下的灵敏度
+
+BLE 接收灵敏度 **-95 dBm**（1Mbps），datasheet 中没有分别给出 DC-DC 和 LDO 两种条件下的灵敏度数值。如果 DC-DC 会导致可测量的灵敏度下降，Nordic 必须分别标注。不区分 = 差异在测量误差以内。
+
+#### 三层隔离机制
+
+```
+                    nRF52840 内部
+┌─────────────────────────────────────────────┐
+│                                             │
+│  DC-DC 开关节点 (~1-4 MHz)                   │
+│       │                                     │
+│       ▼ 外部 10μH 电感滤波                   │  ← 第一层：LC 低通滤波
+│       │                                     │
+│    VDD / 1.3V (REG1 输出)                    │
+│       │                                     │
+│    内部独立 LDO ──→ 1.1V (DEC1, 射频模拟)    │  ← 第二层：射频有独立稳压器
+│    内部独立 LDO ──→ 1.3V (DEC2/5, 射频数字)  │
+│       │                                     │
+│    VSS_PA (专用射频地引脚)                    │  ← 第三层：专用地平面隔离
+│                                             │
+└─────────────────────────────────────────────┘
+```
+
+**第一层 — 频率差距 + LC 滤波**：DC-DC 开关频率约 1-4 MHz，BLE 在 2400 MHz，差了 3 个数量级。10μH 电感 + 去耦电容组成的 LC 滤波器把开关纹波压到极低。高次谐波要到达 2.4GHz 需要经过 600+ 次倍频，幅度早已衰减到噪底以下。
+
+**第二层 — 射频有独立内部稳压器**：射频前端不是直接从 REG1 取电。DEC1（1.1V）和 DEC2/DEC5（1.3V）是射频模块自己的内部 LDO 输出，从 REG1 的 1.3V 进一步稳压，再次隔离 DC-DC 纹波。
+
+**第三层 — 专用射频地引脚**：VSS_PA 是射频功放的独立地引脚，低阻抗直连地平面，避免 DC-DC 开关电流的地弹噪声通过共阻抗耦合到射频回路。
+
+#### 射频功耗对比：DC-DC 让射频也省电约 50%
+
+DC-DC 不仅不干扰射频，还因为高效降压让射频功耗大幅降低：
+
+| 射频场景 | DC-DC (3V) | LDO (3V) | 节省 |
+|---------|-----------|---------|------|
+| TX @+8dBm | 14.8 mA | 32.7 mA | **55%** |
+| TX @+4dBm | 9.6 mA | 21.4 mA | **55%** |
+| TX @0dBm | 4.8 mA | 10.6 mA | **55%** |
+| TX @-4dBm | 3.1 mA | 8.1 mA | **62%** |
+| TX @-20dBm | 2.7 mA | 5.6 mA | **52%** |
+| RX 1Mbps BLE | 4.6 mA | 9.9 mA | **54%** |
+| RX 2Mbps BLE | 5.2 mA | 11.1 mA | **53%** |
+
+> 射频本身消耗的功率不变，省电来自 DC-DC 高效降压（效率 ~85%，把 3.7V 降到 1.3V），比 LDO（效率 = 1.3/3.7 ≈ 35%）少浪费大量能量。
+
+#### 对 E73 模组用户的注意事项
+
+E73 模组内部已包含 RF 匹配网络、天线（或天线引脚）、大部分 DEC 去耦电容。模组外部需要关注的：
+
+| 事项 | 说明 |
+|------|------|
+| REG1 DCC 电感 | E73 模组通常已包含，需确认模组手册 |
+| REG0 DCCH 电感 | High Voltage 模式需在模组外部焊接 10μH，**尽量靠近 DCCH 引脚** |
+| DCCH 电感位置 | **远离模组天线区域**，缩短开关电流回路面积 |
+| 地平面 | 模组下方和周围保持完整地平面，不要被 DC-DC 走线切割 |
+
+### 睡眠电流（不受 DC-DC/LDO 选择影响，DC-DC 自动关闭）
+
+| 状态 | 电流 | 说明 |
+|------|------|------|
+| System OFF, 无 RAM | **0.40 μA** | 最低功耗 |
+| System OFF, 全 RAM | 1.86 μA | |
+| System ON, 无 RAM, 事件唤醒 | 0.97 μA | |
+| System ON, 全 RAM + RTC | 3.16 μA | 键盘深睡眠典型值 |
+| System OFF, High Voltage 5V VDDH | 0.95 μA | USB 供电时 |
+
+### 硬件设计要点
+
+#### DEC 引脚完整接法
+
+| 引脚 | aQFN73 位置 | 电压 | 去耦电容 | 备注 |
+|------|------------|------|---------|------|
+| DEC1 | C1 | 1.1V | 100nF (0402) | 核心逻辑内部稳压器 |
+| DEC2 | A18 | 1.3V | 100nF (0402) | 射频数字 |
+| DEC3 | D23 | — | 100nF (0402) | 通用去耦 |
+| **DEC4** | **B5** | **1.3V** | **1μF (共用)** | **必须连到 DEC6 (E24)** |
+| DEC5 | N24 | 1.3V | 100nF (0402) | 射频数字 |
+| **DEC6** | **E24** | **1.3V** | ↑ 和 DEC4 共用 | **必须连到 DEC4 (B5)** |
+| DECUSB | — | 3.3V | 100nF (0402) | USB PHY |
+
+> DEC4 和 DEC6 是同一条 1.3V 内部稳压器轨道从两个引脚引出。在原理图中用一个网络 `DEC4_6` 连接，共用一颗去耦电容。Nordic 参考设计和 MakerDiary nRF52840 Connect Kit 都是这么连的。
+
+#### 必须的外部元件（Config 4 参考设计 BOM）
+
+启用 DC-DC **必须**连接外部 LC 滤波器，否则芯片无法工作（包括无法 SWD 调试）：
+
+| 引脚 | 元件 | 说明 |
+|------|------|------|
+| **DCC → L2 → (C15/C16) → L3 → VDD** | L2=10μH + L3=15nH + C15=1μF + C16=47nF | REG1 DC-DC 二级滤波（见下文详解） |
+| **DCCH ↔ VDDH** | 10μH 电感 | REG0 DC-DC 必须（仅 High Voltage 模式） |
+| VDD | 4.7μF MLCC | 去耦 |
+| DEC4_6 | 1μF MLCC | DEC4 + DEC6 共用去耦 |
+
+> **警告**：不要在没有连接外部电感的情况下在固件中启用 DC-DC，否则会导致设备砖化，包括无法 SWD 调试！
+
+#### REG1 DC-DC 的两颗电感：为什么 L2 (10μH) 和 L3 (15nH) 串联？
+
+Nordic 参考设计 Config 4 中，DCC 到 VDD 之间不是简单的一颗电感，而是二级滤波拓扑：
+
+```
+DCC (pin B3)                                              VDD nRF
+    │                                                        │
+    └── L2 (10μH) ──┬── L3 (15nH) ──────────────────────────┘
+       DC-DC 主储能   │    高频 EMI 滤波
+                     ├── C15 (1.0μF) ── GND    中频旁路
+                     └── C16 (47nF)  ── GND    高频旁路
+```
+
+两颗电感的作用完全不同：
+
+| 电感 | 值 | 封装 | 作用 | 工作频段 |
+|------|-----|------|------|---------|
+| **L2** | **10μH** | 0603 | DC-DC **主储能电感**，buck 转换器核心元件，开关期间存储/释放能量 | ~1-4 MHz (开关基频) |
+| **L3** | **15nH** | 0402 高频电感 | **EMI 高频滤波器**，阻隔开关噪声的高次谐波到达 VDD | >100 MHz |
+
+**为什么 L2 一颗不够？**
+
+L2 (10μH) 对开关基频（1-4MHz）的纹波滤波效果很好，但 10μH 电感绕线多、寄生电容大，在几十 MHz 以上会到达自谐振频率，阻抗反而下降，高频谐波会"穿过去"到 VDD：
+
+```
+阻抗对比：
+
+           L2 (10μH)          L3 (15nH)
+           ─────────          ──────────
+@ 1 MHz    62.8 Ω  ← 主战场   0.094 Ω  ← 几乎透明
+@ 10 MHz   628 Ω              0.94 Ω
+@ 100 MHz  ↓ 自谐振，阻抗崩塌  9.4 Ω    ← 开始起作用
+@ 500 MHz  寄生电容主导        47 Ω     ← 明显衰减
+@ 2.4 GHz  基本短路            226 Ω    ← 有效阻隔 BLE 频段噪声
+```
+
+L3 (15nH) 体积极小（0402），寄生电容极低，自谐振频率在 GHz 级，高频特性好。它和 C15/C16 组成**二级 π 滤波器**：
+
+```
+DCC（脏）                                    VDD（干净）
+  │                                            │
+  L2 (10μH) ── 滤掉 1-4MHz 开关基波纹波         │
+  │                                            │
+  ├── C15 (1μF)  ── GND   旁路中频噪声          │
+  ├── C16 (47nF) ── GND   旁路高频噪声          │
+  │                                            │
+  L3 (15nH) ── 滤掉残余 >100MHz 高次谐波 ───────┘
+```
+
+> 这就是上一节"三层隔离"中第一层的具体实现。通过两颗不同量级的电感覆盖从 MHz 到 GHz 的完整频段，确保 VDD 上的纹波对 2.4GHz BLE 射频没有可测量的干扰。
+
+#### 四种配置组合
+
+| 配置 | 供电模式 | REG0 | REG1 | 外部电感 | 适用场景 |
+|------|---------|------|------|---------|---------|
+| 1 | Normal V, LDO | 禁用 | LDO | 无 | 最简单，原型验证 |
+| 2 | Normal V, DC-DC | 禁用 | **DC-DC** | DCC↔DEC4 | 纽扣电池省电 |
+| 3 | High V, LDO | LDO | LDO | 无 | LiPo 供电，不省电 |
+| **4** | **High V, DC-DC** | **DC-DC** | **DC-DC** | DCCH↔VDDH + DCC↔DEC4 | **LiPo 供电，最省电（推荐）** |
+
+### Zephyr / ZMK DeviceTree 配置
+
+#### 硬件与 DTS 的对应关系
+
+这是关键：**DTS 中的 `&reg0` / `&reg1` 节点直接映射到 nRF52840 硬件寄存器**，而不是软件抽象。你的 PCB 上有没有焊电感，决定了 DTS 中能不能启用对应的 DC-DC。
+
+```
+硬件 PCB                              Zephyr DTS
+─────────                              ──────────
+DCCH 引脚焊了 10μH 到 VDDH   ←对应→   &reg0 { status = "okay"; }
+DCC  引脚焊了 10μH 到 DEC4    ←对应→   &reg1 { regulator-initial-mode = <NRF5X_REG_MODE_DCDC>; }
+```
+
+#### REG1：核心级 DC-DC（所有板子都应该启用）
+
+在板级 `.dts` 文件中：
+
+```dts
+&reg1 {
+    regulator-initial-mode = <NRF5X_REG_MODE_DCDC>;
+};
+```
+
+**前提**：PCB 上 DCC 和 DEC4 之间必须连接了 10μH 电感。
+
+这是 ZMK 生态中最普遍的配置，以下板子全部启用了此项：
+
+| 板子 | DTS 文件 |
+|------|---------|
+| nice!nano | `app/module/boards/nicekeyboards/nice_nano/nice_nano.dts` |
+| nrfmicro (全系列) | `app/module/boards/joric/nrfmicro/nrfmicro_nrf52840.dts` |
+| Glove80 | `app/boards/moergo/glove80/glove80.dtsi` |
+| Kinesis Adv360 Pro | `app/boards/kinesis/adv360pro/adv360pro.dtsi` |
+| nice!60 | `app/boards/nicekeyboards/nice60/nice60_nrf52840_zmk.dts` |
+| Mikoto | `app/module/boards/zhiayang/mikoto/mikoto.dts` |
+| PolarityWorks CKP | `app/boards/polarityworks/common/ckp-base.dtsi` |
+
+#### REG0：高压级 DC-DC（仅 High Voltage 模式的板子）
+
+```dts
+&reg0 {
+    status = "okay";
+};
+```
+
+**前提**：
+1. 使用 aQFN73 封装（或含 aQFN73 的模组如 E73）
+2. VDDH 引脚独立接电池/USB（不与 VDD 短接）
+3. DCCH 和 VDDH 之间连接了 10μH 电感
+
+> nice!nano 在高压模式下工作（LiPo 接 VDDH），但其 DTS 中**未启用 REG0 DC-DC**（即 REG0 用 LDO 模式）。如果你自己设计 PCB 并焊了 DCCH 电感，可以额外启用 `&reg0` 进一步省电。
+
+#### REG0 输出电压配置
+
+REG0 的输出电压通过 UICR 的 REGOUT0 寄存器配置，在 Zephyr 中：
+
+```c
+/* 在 bootloader 或应用初始化中写 UICR */
+if ((NRF_UICR->REGOUT0 & UICR_REGOUT0_VOUT_Msk) != UICR_REGOUT0_VOUT_3V3) {
+    NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Wen;
+    while (NRF_NVMC->READY == NVMC_READY_READY_Busy) {}
+    NRF_UICR->REGOUT0 = UICR_REGOUT0_VOUT_3V3;  // 值 = 5
+    NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Ren;
+    NVIC_SystemReset();  // UICR 变更需要复位生效
+}
+```
+
+> nice_nano bootloader 默认将 REGOUT0 设为 3.3V。如果你用裸芯片从空白状态启动，默认是 1.8V，需要在 bootloader 中配置。
+
+### 自己设计 PCB 的 Checklist
+
+根据你使用模组（E73）还是裸芯片（aQFN73），硬件和 DTS 需要配套：
+
+#### 方案 A：E73-2G4M08S1C 模组（推荐）
+
+```
+模组引脚      外部电路              DTS 配置
+────────      ────────              ────────
+VDDH ──────── LiPo 电池正极
+DCCH ──┤10μH├── VDDH               &reg0 { status = "okay"; }
+VDD  ──────── 4.7μF 到 GND
+DCC  ──┤10μH├── DEC4               &reg1 { regulator-initial-mode = <NRF5X_REG_MODE_DCDC>; }
+DEC4 ──────── 1μF 到 GND
+GND  ──────── 电池负极
+```
+
+模组内部已包含：32MHz 主晶振、RF 匹配网络、天线（或天线引脚）。外接：32.768KHz 晶振（XL1/XL2）+ 两颗电感 + 去耦电容。
+
+#### 方案 B：nRF52840 aQFN73 裸芯片
+
+除了方案 A 的所有元件，还需要额外：
+
+| 额外元件 | 说明 |
+|---------|------|
+| 32MHz 晶振 + 2×12pF 负载电容 | XC1/XC2 引脚 |
+| 32.768KHz 晶振 | XL1/XL2 引脚 |
+| RF 匹配网络 (π 型) | ANT 引脚，参考 Nordic 参考设计 |
+| 天线（PCB 天线或陶瓷天线） | |
+| DEC1~DEC6 去耦电容 (100nF×6) | 各电源引脚 |
+| VBUS 去耦电容 (如果用 USB) | |
+
+#### DTS 完整配置模板（keebdeck BLE 版）
+
+```dts
+/* keebdeck_ble.dts - 基于 E73 模组 + LiPo 电池 */
+
+/* 启用 REG0 高压 DC-DC (DCCH 电感已焊) */
+&reg0 {
+    status = "okay";
+};
+
+/* 启用 REG1 核心 DC-DC (DCC 电感已焊) */
+&reg1 {
+    regulator-initial-mode = <NRF5X_REG_MODE_DCDC>;
+};
+
+/* GPIO 控制外设电源 */
+/ {
+    ext_power {
+        compatible = "zmk,ext-power-generic";
+        control-gpios = <&gpio0 13 GPIO_ACTIVE_HIGH>;  /* P0.13, LDO CE 方案 */
+    };
+};
+```
+
+### 常见踩坑
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| 启用 DC-DC 后芯片砖化 | PCB 没焊电感 | 必须先焊电感再改 DTS；救砖用 SWD 擦除重刷 |
+| REG0 输出 1.8V 不是 3.3V | UICR REGOUT0 未配置 | 在 bootloader 中写 REGOUT0 = 5 (3.3V) |
+| High Voltage 模式不工作 | VDD 和 VDDH 短接了 | 检查 PCB，High Voltage 模式要求 VDD 仅由 REG0 输出 |
+| 功耗比预期高 | DTS 中忘记启用 DC-DC | 检查 `regulator-initial-mode` 是否设为 DCDC |
+| QFN48 无法用 High Voltage | VDD/VDDH 内部短接 | QFN48 只能用 Normal Voltage + REG1 DC-DC |
 
 ## Troubleshooting
 
@@ -818,3 +1355,560 @@ v2 方案更简洁：新一代 LDO（XC6220 shutdown <1μA，ME6217 shutdown ~0.
 - JLinkExe command files don't support `#` comments or `print`
 - Each line must be a valid JLink command
 - Use bash `echo` for messages, keep `.jlink` files as pure commands
+
+---
+
+## IMU 传感器 (QMI8658A) DTS 配置
+
+> 参考：`zephyr/dts/bindings/sensor/qst,qmi8658a.yaml`
+
+### DTS Binding 官方示例
+
+```dts
+#include <zephyr/dt-bindings/gpio.h>
+
+qmi8658a@6b {
+    compatible = "qst,qmi8658a";
+    reg = <0x6b>;
+    accel-fs = <4>;      /* ±4g */
+    gyro-fs = <512>;     /* ±512 dps */
+    accel-odr = <896>;   /* 896 Hz */
+    gyro-odr = <896>;    /* 896 Hz */
+    int-gpios = <&gpio0 10 GPIO_ACTIVE_HIGH>;
+    int-pin = <2>;       /* 使用 INT2 */
+};
+```
+
+### 各属性说明
+
+| 属性 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| `compatible` | string | 是 | 必须为 `"qst,qmi8658a"` |
+| `reg` | int | 是 | I2C 地址：`0x6a`（SA0 悬空/上拉）或 `0x6b`（SA0 接 GND） |
+| `accel-fs` | int | 否 | 加速度计量程，可选 2/4/8/16 (g)，默认 4 |
+| `gyro-fs` | int | 否 | 陀螺仪量程，可选 16/32/64/128/256/512/1024/2048 (dps)，默认 512 |
+| `accel-odr` | int | 否 | 加速度计采样率，可选 28/56/112/224/448/896/1792/3584/7174 (Hz)，默认 896 |
+| `gyro-odr` | int | 否 | 陀螺仪采样率，同上，默认 896 |
+| `int-gpios` | phandle | 否 | 中断 GPIO 引脚，不填则使用轮询模式 |
+| `int-pin` | int | 否 | 使用 INT1 (`1`) 或 INT2 (`2`)，默认 2 |
+
+### keebdeck 最简配置（轮询，不接中断）
+
+```dts
+&i2c0 {
+    status = "okay";
+
+    qmi8658a@6a {
+        compatible = "qst,qmi8658a";
+        reg = <0x6a>;       /* SA0 悬空 = 0x6A（内部 200KΩ 上拉） */
+    };
+};
+```
+
+### keebdeck 带中断配置
+
+```dts
+&i2c0 {
+    status = "okay";
+
+    qmi8658a@6a {
+        compatible = "qst,qmi8658a";
+        reg = <0x6a>;
+        accel-fs = <4>;
+        gyro-fs = <512>;
+        accel-odr = <224>;   /* 飞鼠 224 Hz 足够，省电 */
+        gyro-odr = <224>;
+        int-gpios = <&gpio0 XX GPIO_ACTIVE_HIGH>;  /* 替换 XX 为实际引脚 */
+        int-pin = <2>;
+    };
+};
+```
+
+### Kconfig
+
+```
+CONFIG_SENSOR=y
+CONFIG_QMI8658A=y
+# 轮询模式（默认，不需要接 INT）:
+CONFIG_QMI8658A_TRIGGER_NONE=y
+# 或者中断模式（需接 INT 引脚）:
+# CONFIG_QMI8658A_TRIGGER_OWN_THREAD=y
+```
+
+---
+
+## QMI8658A + nRF52840 低功耗策略
+
+### QMI8658A 没有 Chip EN 引脚，需要 MOSFET 切电源吗？
+
+**不需要。** QMI8658A 通过寄存器就能进入极低功耗状态，且支持硬件 Wake-on-Motion（WoM）自动唤醒。
+
+### QMI8658A 各功耗模式（VDD=VDDIO=1.8V）
+
+| 模式 | CTRL7 配置 | 电流 | 说明 |
+|------|-----------|------|------|
+| **Power-Down** | CTRL1 sensorDisable=1, CTRL7=0x00 | **~20μA** | 最低功耗，寄存器值保留，数字接口可通信 |
+| 待机（默认上电） | CTRL7=0x00 | ~50μA | 传感器关，时钟开 |
+| **Wake-on-Motion** | aEN=1, aODR=3Hz | **~30μA** | 加速度计低功耗采样，运动时触发 INT |
+| 仅加速度计（31.25Hz） | aEN=1 | ~55μA | 倾斜/手势检测 |
+| 6 轴全速（29.375Hz） | aEN=1, gEN=1 | ~750μA | 飞鼠活跃状态 |
+| 6 轴高速（896Hz） | aEN=1, gEN=1 | ~550μA | 高刷飞鼠 |
+
+### 软件 Power-Down vs 硬件 MOSFET 切 VDD
+
+| 因素 | 软件 Power-Down (CTRL7=0x00) | 硬件 MOSFET 切 VDD |
+|------|---------------------------|-------------------|
+| 静态电流 | ~20μA | **0μA**（完全断电） |
+| Wake-on-Motion | **支持**（IMU 硬件检测，INT 唤醒 MCU） | **不支持**（IMU 断电无法检测运动） |
+| 唤醒延迟 | 快：WoM 中断立即触发 | 慢：上电 150ms + 重新配置寄存器 |
+| 寄存器状态 | **保留** | 丢失，必须全部重新初始化 |
+| I2C 总线 | 正常 | 需注意：VDD 断电后 I2C 上拉可能通过 ESD 管反灌电 |
+| 额外元件 | 无 | PMOS + 栅极电阻 |
+| 复杂度 | 简单寄存器写入 | PCB 布局 + 总线隔离 |
+
+**结论：对于键盘应用，软件 Power-Down (~20μA) + WoM (~30μA) 完全足够。不需要 MOSFET。**
+
+> 20-30μA 对比 nRF52840 本身的休眠电流（System ON + RTC ~3-5μA）只多了一点，对电池寿命影响极小。一颗 110mAh 电池仅 IMU 待机就能撑 ~150 天。
+
+### 推荐的四级功耗管理方案
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 状态 1：飞鼠活跃                                              │
+│ ─────────────────                                           │
+│ 加速度计 + 陀螺仪 全开 (CTRL7 = aEN|gEN = 0x03)               │
+│ ODR: 112-224 Hz                                             │
+│ IMU 电流: ~550-750μA                                         │
+│ MCU: 运行 Madgwick 融合 + BLE HID 上报                        │
+│                                                             │
+│ 触发条件：检测到键盘按键 + 运动                                  │
+│ 退出条件：N 秒无按键/无运动 → 进入状态 2                         │
+└───────────────────────────┬─────────────────────────────────┘
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 状态 2：Wake-on-Motion 待机                                    │
+│ ───────────────────────                                     │
+│ 关闭陀螺仪 (CTRL7 gEN=0)                                     │
+│ 加速度计低功耗 3Hz (CTRL7 aEN=1, CTRL2 aODR=3Hz)              │
+│ 配置 WoM 阈值 + INT 中断                                      │
+│ IMU 电流: ~30μA                                              │
+│ MCU: 可进入 System ON idle                                    │
+│                                                             │
+│ 触发条件：飞鼠闲置 N 秒                                        │
+│ 退出条件：WoM 中断（运动检测）→ 回到状态 1                       │
+│          M 秒无运动 → 进入状态 3                                │
+└───────────────────────────┬─────────────────────────────────┘
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 状态 3：ZMK Idle（键盘空闲）                                    │
+│ ──────────────────────                                      │
+│ IMU Power-Down (CTRL1 sensorDisable=1, CTRL7=0x00)          │
+│ IMU 电流: ~20μA                                              │
+│ ZMK: CONFIG_ZMK_IDLE_TIMEOUT (默认 30s)                      │
+│ BLE: 保持连接，降低广播频率                                     │
+│                                                             │
+│ 触发条件：WoM 待机超时 M 秒                                    │
+│ 退出条件：按键 → 回到状态 2 或 1                                │
+│          ZMK sleep timeout → 进入状态 4                       │
+└───────────────────────────┬─────────────────────────────────┘
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 状态 4：ZMK Deep Sleep                                        │
+│ ──────────────────                                          │
+│ IMU Power-Down (CTRL7=0x00, ~20μA)                          │
+│ ZMK: CONFIG_ZMK_IDLE_SLEEP_TIMEOUT (默认 900s = 15 分钟)     │
+│ nRF52840: System OFF (~1.5μA)                               │
+│ BLE: 断开连接                                                │
+│ 总系统电流: ~22μA                                             │
+│                                                             │
+│ 触发条件：ZMK 空闲超时                                         │
+│ 退出条件：键盘矩阵 GPIO 中断唤醒（按任意键）                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### QMI8658A Wake-on-Motion 配置流程
+
+```c
+// 1. 关闭所有传感器
+i2c_reg_write_byte(CTRL7, 0x00);  // aEN=0, gEN=0
+
+// 2. 配置加速度计为低功耗 3Hz
+i2c_reg_write_byte(CTRL2, (FS_4G << 4) | ODR_3HZ);
+
+// 3. 设置 WoM 阈值（CAL1_L，1mg/LSB，例如 200mg）
+i2c_reg_write_byte(CAL1_L, 200);  // 200mg 阈值
+
+// 4. 配置 WoM 中断引脚（CAL1_H）
+i2c_reg_write_byte(CAL1_H, INT2_PIN);  // 用 INT2
+
+// 5. 执行 CTRL9 命令写入 WoM 设置
+i2c_reg_write_byte(CTRL9, CTRL_CMD_WRITE_WOM_SETTING);
+// 等待 CTRL9 命令完成...
+
+// 6. 启用加速度计进入 WoM 模式
+i2c_reg_write_byte(CTRL7, 0x01);  // aEN=1
+
+// 现在 IMU 在 ~30μA 下运行，运动超过 200mg 时 INT2 触发
+```
+
+> **注意**：当前 Zephyr QMI8658A 驱动未实现 WoM 功能，需要自行扩展。但寄存器操作很简单，核心就是 CTRL9 命令协议 + CTRL7 控制。
+
+### 参考项目
+
+| 项目 | 平台 | 说明 |
+|------|------|------|
+| [idevloop/Air_Mouse-IMU_Gesture_HID_Controller](https://github.com/idevloop/Air_Mouse-IMU_Gesture_HID_Controller_XIAO_nRF52840) | XIAO nRF52840 + LSM6DS3TR-C | Arduino BLE 飞鼠，非 ZMK |
+| [aroum/ufa](https://github.com/aroum/ufa) | nRF52840 + PAW3395/PMW3610 | ZMK 游戏鼠标固件，光学传感器 |
+| [inorichi/zmk-pmw3610-driver](https://github.com/inorichi/zmk-pmw3610-driver) | ZMK + PMW3610 | 含 SPI 休眠模式的 ZMK pointing 驱动 |
+
+**目前没有 ZMK + IMU 飞鼠的现成项目。** keebdeck 如果做出来会是第一个。
+
+## BLE 电池电量上报 (Battery Service)
+
+### 原理：BLE Battery Service (BAS)
+
+BLE 标准定义了 **Battery Service (BAS)**，是 Bluetooth SIG 官方 GATT 服务，专门用于上报设备电量：
+
+| 项目 | 值 | 说明 |
+|------|-----|------|
+| Service UUID | `0x180F` | Battery Service |
+| Characteristic UUID | `0x2A19` | Battery Level |
+| 数据格式 | `uint8` (0-100) | 百分比 |
+| 支持操作 | **Read** + **Notify** | 主机可主动读取，也可订阅通知 |
+
+工作流程：
+
+```
+键盘固件 ADC 读电压 → 转换为百分比 → bt_bas_set_battery_level(pct)
+                                           │
+                                           ▼
+                              BLE GATT 通知 (0x180F / 0x2A19)
+                                           │
+                                           ▼
+                              主机 OS 显示电池图标和百分比
+```
+
+**不需要额外的 UUID 或自定义描述符**，BAS 是标准协议，所有主流 OS 原生支持。
+
+### 各操作系统支持情况
+
+| 操作系统 | 显示位置 | 备注 |
+|---------|---------|------|
+| **macOS** | 系统设置 > 蓝牙、菜单栏蓝牙图标 | ⚠️ BAS 通知会唤醒 Mac（见下方已知问题） |
+| **iOS / iPadOS** | 设置 > 蓝牙、电池小组件 | 自动识别 |
+| **Windows 10/11** | 设置 > 蓝牙和其他设备 | 1809+ 版本支持，1903+ 更稳定 |
+| **Linux** | BlueZ → UPower → GNOME/KDE 电池面板 | `upower -d` 或 `bluetoothctl info` 可查看 |
+| **Android 8.1+** | 设置 > 已连接的设备、通知栏 | 自动读取 BAS |
+
+### ZMK 已内置完整支持
+
+ZMK 主线已经集成了 BLE 电池上报，基于 Zephyr 的 `bt_bas` 实现。
+
+#### 关键 Kconfig 选项
+
+| 选项 | 默认值 | 说明 |
+|------|--------|------|
+| `CONFIG_ZMK_BATTERY_REPORTING` | BLE 启用时自动开启 | 电池检测和上报主开关 |
+| `CONFIG_ZMK_BATTERY_REPORT_INTERVAL` | 60 (秒) | 上报间隔 |
+| `CONFIG_BT_BAS` | 自动开启 | Zephyr BLE Battery Service |
+| `CONFIG_ZMK_BATTERY_REPORTING_FETCH_MODE` | `STATE_OF_CHARGE` | 可选 `LITHIUM_VOLTAGE`（线性电压映射） |
+
+#### 电池驱动（二选一）
+
+| 驱动 | compatible | 适用场景 | 额外硬件 |
+|------|-----------|---------|---------|
+| **nRF VDDH** | `zmk,battery-nrf-vddh` | nRF52840 直接读 VDDH | **无需额外硬件** |
+| 分压器 ADC | `zmk,battery-voltage-divider` | 通用方案 | 需要电阻分压器 + ADC 引脚 |
+
+#### DTS 配置（nRF52840 VDDH 方案，推荐）
+
+```dts
+/ {
+    chosen {
+        zmk,battery = &vbatt;
+    };
+};
+
+&adc {
+    vbatt: vbatt {
+        compatible = "zmk,battery-nrf-vddh";
+    };
+};
+```
+
+> **E73-2G4M08S1C 模组直接可用**：nRF52840 的 VDDH 引脚直连电池正极（经 LiPo 充电电路），`zmk,battery-nrf-vddh` 驱动通过片内 SAADC 读取 VDDH 电压，无需外部分压电阻，零额外 BOM。
+
+#### 硬件接线：为什么不需要外部分压电阻？
+
+**nRF52840 片内自带 VDDH/5 分压器**，SAADC 可以直接选择 `VDDHDIV5` 作为 ADC 输入通道，无需任何外部元件。
+
+```
+                          nRF52840 片内
+                    ┌──────────────────────────┐
+                    │                          │
+LiPo B+ ──────────→│ VDDH (Pin 23 on E73)     │
+(3.0-4.2V)          │   │                      │
+                    │   ├──→ REG0 DC/DC → VDD  │
+                    │   │                      │
+                    │   └──→ 内部 1/5 分压 ─────│──→ SAADC "VDDHDIV5" 通道
+                    │        (片内电阻)        │     (读出值 × 5 = 电池电压)
+                    │                          │
+LiPo B- ──────────→│ GND (Pin 5/21/24 on E73) │
+                    └──────────────────────────┘
+```
+
+**ADC 测量原理：**
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| ADC 输入 | `VDDHDIV5` | VDDH 经片内 1/5 分压 |
+| 参考电压 | 0.6V (内部) | nRF52840 SAADC 内部基准 |
+| 增益 | 1/2 | 有效量程 = 0.6V / 0.5 = 1.2V |
+| 最大可测 VDDH | 1.2V × 5 = **6.0V** | LiPo 4.2V 完全在量程内 |
+| 分辨率 | 12-bit | 4096 级，~1.5mV 分辨率 |
+| 过采样 | 4× | 降低噪声 |
+| 采集时间 | 40μs | 单次采样耗时极短 |
+
+**举例**：电池 4.2V 时，ADC 输入 = 4.2V / 5 = 0.84V，远在 1.2V 量程内，精度充裕。
+
+#### E73-2G4M08S1C 模组接线
+
+```
+E73 模组                            外部元件
+───────                            ────────
+Pin 23 (VDH/VDDH) ←───────────── LiPo B+ (3.0-4.2V)
+Pin 25 (DCH/DCCH)  ──── 100nF ── GND    (REG0 DC/DC 输出去耦)
+Pin 19 (VCC/VDD)   ──── 100nF ── GND    (VDD 去耦)
+                    ──── 4.7μF ── GND    (VDD 储能)
+Pin 5/21/24 (GND)  ──────────── LiPo B-
+```
+
+**电池电量检测不需要额外引脚和元件**：
+- 不需要 ADC 引脚（使用片内 VDDHDIV5 通道）
+- 不需要分压电阻
+- 不需要 GPIO 控制电源开关
+- 只要 LiPo 接到 VDDH + GND，固件就能自动读取电压
+
+#### nice!nano 两代方案对比
+
+| 版本 | 驱动 | 外部元件 | 占用引脚 |
+|------|------|---------|---------|
+| **nice!nano v2** | `zmk,battery-nrf-vddh` | **无** | **无** |
+| nice!nano v1 | `zmk,battery-voltage-divider` | 806KΩ + 2MΩ 分压电阻 | P0.04 (AIN2) |
+
+v1 的 DTS 配置（仅供参考，不推荐新设计使用）：
+
+```dts
+/* nice!nano v1 — 外部分压器方案，需要额外电阻和 ADC 引脚 */
+vbatt: vbatt {
+    compatible = "zmk,battery-voltage-divider";
+    io-channels = <&adc 2>;           /* AIN2 = P0.04 */
+    output-ohms = <2000000>;           /* 2MΩ 下臂 */
+    full-ohms = <(2000000 + 806000)>;  /* 2MΩ + 806KΩ = 2.806MΩ 总阻 */
+};
+```
+
+> **keebdeck 推荐使用 v2 方案**（`zmk,battery-nrf-vddh`），零外部元件，零引脚占用。
+> **但前提是电源路径设计正确**，见下方分析。
+
+#### PMOS 电源切换对 VDDHDIV5 电量测量的影响
+
+**核心问题不是 PMOS 压降，而是 USB 接入时 VDDH 引脚看到的是什么电压。**
+
+##### 场景分析
+
+```
+场景 A：纯电池供电（USB 未接）
+
+    LiPo B+ (4.0V) ──→ PMOS ──→ VDDH
+                        Vds≈30mV
+    VDDH ≈ 3.97V
+    VDDHDIV5 读数 = 3.97V / 5 = 0.794V → 软件 ×5 → 3.97V
+    误差：30mV（< 1%），完全可接受 ✅
+
+场景 B：USB 接入，简单 PMOS 切换（问题所在！）
+
+    VBUS (5V) ──→ PMOS ──→ VDDH    ← VDDH 现在是 5V！
+    LiPo B+ (3.8V) ──→ PMOS 截止    ← 电池被断开
+    VDDHDIV5 读数 = 5.0V / 5 = 1.0V → 软件 ×5 → 5000mV
+    固件算出电量 = 100%，但这是 USB 电压，不是电池电压！❌
+```
+
+**结论：如果 PMOS 在 USB 接入时把 VDDH 切到 VBUS，VDDHDIV5 就完全无法测量电池电量。**
+
+##### 为什么 nice!nano v1 用外部分压器？
+
+nice!nano v1 不是没注意到片内 VDDHDIV5，而是**它的电源路径设计决定了不能用 VDDHDIV5**：
+
+| | nice!nano v1 | nice!nano v2 |
+|---|---|---|
+| **充电 IC** | LN2054Y42AMR（简单线性充电器） | **BQ24072**（TI，带 DPPM 电源路径管理） |
+| **电源切换** | PMOS 简单开关 | BQ24072 内置 DPPM |
+| **USB 接入时 VDDH** | 可能看到 VBUS (~5V) | **OUT 引脚始终跟踪电池电压** |
+| **电池测量方案** | 外部分压器接在 B+ 上 → P0.04 | VDDHDIV5（片内） |
+| **ext-power 极性** | P0.13 `GPIO_ACTIVE_LOW` | P0.13 `GPIO_ACTIVE_HIGH` |
+
+v1 的外部分压器**直接连在电池 B+ 端子上**，绕过了 PMOS 电源开关，所以无论 USB 是否接入，P0.04 始终读到的是真实电池电压。
+
+##### BQ24072 DPPM 为什么能让 VDDHDIV5 工作？
+
+BQ24072 有 **Dynamic Power Path Management (DPPM)**，关键特性：
+
+```
+                    BQ24072
+              ┌─────────────────┐
+VBUS (5V) ──→│ IN          OUT │──→ VDDH (nRF52840)
+              │                 │
+              │    DPPM 控制    │
+              │                 │
+LiPo B+ ←──→│ BAT             │
+              └─────────────────┘
+```
+
+| USB 状态 | BQ24072 OUT 输出 | VDDH 看到 | VDDHDIV5 测量 |
+|---------|-----------------|----------|--------------|
+| **未接** | BAT 直通 → Vbat | 3.0-4.2V | 准确 ✅ |
+| **接入，充电中** | Vbat + ~0.2V | 3.2-4.4V | 偏高 ~200mV，可接受 ✅ |
+| **接入，充满** | ≈ Vbat | ~4.2V | 准确 ✅ |
+
+**BQ24072 的 OUT 引脚始终跟踪电池电压**（不像 BQ24075 会输出 VBUS 电压），所以 VDDH 始终反映电池状态，VDDHDIV5 可以正确工作。
+
+##### 三种电源路径方案对比
+
+| 方案 | VDDH 来源 | USB 时 VDDH | VDDHDIV5 可用？ | 电池测量方法 |
+|------|----------|------------|---------------|------------|
+| **DPPM 充电 IC (BQ24072)** | IC OUT 引脚 | ≈ Vbat + 0.2V | **可以** ✅ | `zmk,battery-nrf-vddh` |
+| **简单 PMOS 开关** | PMOS 输出 | VBUS (~5V) | **不行** ❌ | 外部分压器接 B+ |
+| **二极管 OR** | 二极管输出 | VBUS - 0.3V (~4.7V) | **不行** ❌ | 外部分压器接 B+ |
+
+##### keebdeck 设计建议
+
+**如果用简单 PMOS 电源切换（无 DPPM 充电 IC）：**
+
+```
+LiPo B+ ──┬──→ PMOS ──→ VDDH (供电)
+           │
+           └──→ 806KΩ ──┬──→ P0.xx (AIN) ──→ ADC 读取
+                         │
+                    2MΩ ──┤
+                         │
+                        GND
+
+分压比 = 2M / (2M + 806K) = 0.713
+4.2V 电池 → ADC 输入 = 2.99V
+3.0V 电池 → ADC 输入 = 2.14V
+```
+
+DTS 配置：
+
+```dts
+vbatt: vbatt {
+    compatible = "zmk,battery-voltage-divider";
+    io-channels = <&adc X>;            /* 替换 X 为实际 AIN 通道号 */
+    output-ohms = <2000000>;            /* 2MΩ 下臂 */
+    full-ohms = <(2000000 + 806000)>;   /* 总阻 2.806MΩ */
+};
+```
+
+> 分压电阻选择高阻值（MΩ 级）是为了最小化漏电流：4.2V / 2.806MΩ ≈ **1.5μA**，对电池寿命影响可忽略。
+
+**如果用 BQ24072 类 DPPM 充电 IC：**
+
+```dts
+/* 不需要外部分压器，直接用 VDDHDIV5 */
+vbatt: vbatt {
+    compatible = "zmk,battery-nrf-vddh";
+};
+
+&reg0 {
+    status = "okay";
+};
+```
+
+**选择建议：**
+
+| 场景 | 推荐方案 |
+|------|---------|
+| 用 BQ24072 / 类似 DPPM 充电 IC | `zmk,battery-nrf-vddh`（零外部元件） |
+| 用简单 PMOS + 线性充电 IC | `zmk,battery-voltage-divider`（需 2 个电阻 + 1 个 AIN 引脚） |
+| 不确定电源路径 | 保守选外部分压器，总是能正确测量 |
+
+#### Kconfig 配置
+
+```
+# 电池上报（BLE 启用时自动开启，通常不需要手动配置）
+CONFIG_ZMK_BATTERY_REPORTING=y
+CONFIG_ZMK_BATTERY_REPORT_INTERVAL=60
+
+# 如果想禁用 BLE 电量上报（但保留本地电池监测）：
+# CONFIG_BT_BAS=n
+```
+
+#### 电压 → 百分比转换
+
+ZMK 内置的锂电池电压映射（`LITHIUM_VOLTAGE` 模式）：
+
+```c
+// zmk/app/src/battery.c
+static uint8_t lithium_ion_mv_to_pct(int16_t bat_mv) {
+    if (bat_mv >= 4200) return 100;
+    else if (bat_mv <= 3450) return 0;
+    else return bat_mv * 2 / 15 - 459;  // 线性近似
+}
+```
+
+| 电压 | 百分比 | 说明 |
+|------|--------|------|
+| ≥ 4.20V | 100% | 满电 |
+| 3.85V | ~54% | |
+| 3.70V | ~34% | |
+| ≤ 3.45V | 0% | 需要充电 |
+
+> 这是线性近似，实际 LiPo 放电曲线是非线性的。对于键盘应用精度足够。
+
+### 分体键盘电量上报
+
+ZMK 支持分体键盘两半的电量分别上报：
+
+| 选项 | 说明 |
+|------|------|
+| `CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING=y` | 主半从副半获取电量 |
+| `CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_PROXY=y` | 主半代理副半电量给主机 |
+
+> 注意：大多数 OS 只显示一个电池电量。要显示两半电量需要自定义工具。
+
+### 已知问题
+
+#### macOS 睡眠唤醒问题（最严重）
+
+macOS 会把 BLE BAS 通知当作「设备活动」，导致 Mac 从睡眠中被唤醒。这是 macOS 的 BLE 实现问题，不是固件 bug。
+
+**解决方案：**
+
+| 方案 | 配置 | 代价 |
+|------|------|------|
+| 禁用 BAS | `CONFIG_BT_BAS=n` | macOS 上不显示电池百分比 |
+| 保持默认 | 不改 | Mac 可能被键盘电量通知唤醒 |
+
+ZMK 文档明确提到了这个问题，建议受影响的 macOS 用户使用 `CONFIG_BT_BAS=n`。
+
+#### 百分比跳变
+
+锂电池电压在 3.5-3.9V 区间变化很平缓，线性映射会导致：
+- 100% → 80% 掉得快（4.2V→3.9V 电压下降快）
+- 80% → 20% 很慢（平台期）
+- 20% → 0% 突然掉没
+
+这是所有 BLE 键盘的通病，不影响实际使用。
+
+### 实现要点总结
+
+对于 keebdeck 项目：
+
+```
+✅ 硬件：不需要额外硬件，nRF52840 VDDH 直接读电池电压
+✅ 固件：ZMK 已内置，CONFIG_ZMK_BLE 启用时自动工作
+✅ 协议：标准 BLE BAS (0x180F)，所有主流 OS 原生支持
+✅ 驱动：zmk,battery-nrf-vddh，零 BOM 成本
+⚠️ macOS：可能会唤醒睡眠，必要时 CONFIG_BT_BAS=n
+```
