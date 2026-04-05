@@ -154,11 +154,12 @@ keebdeck_ble/
 | 用途 | 引脚数 | 具体引脚 |
 |------|--------|---------|
 | 键盘矩阵 (6R+13C) | 19 | D0-D10, D14-D16, D18-D21, P1.02 |
-| I2C (IMU 等) | 2 | D2 (SDA/P0.17), D3 (SCL/P0.20) — 与 ROW2/ROW3 复用! |
-| **总计已用** | **19** | 18 个 Pro Micro + 1 个飞线 |
-| **剩余可用** | **0** | Pro Micro 引脚全部用完 |
+| I2C (IMU 等) | 2 | P0.26 (SDA), P1.09 (SCL) — 不在 Pro Micro 排针上，PCB 直连 |
+| IMU INT (可选) | 1 | P0.03 — DRDY 中断 |
+| **总计已用** | **19+2~3** | 18 个 Pro Micro + 1 个飞线 + 2~3 个 E73 直连 |
+| **剩余可用** | **0** | Pro Micro 引脚全部用完，I2C 用 E73 模组非排针引脚 |
 
-> **注意**：D2/D3 同时被键盘矩阵 (ROW2/ROW3) 和 I2C 使用。如果要接 IMU (QMI8658A)，需要重新规划引脚分配或使用其他 I2C 引脚（非 Pro Micro 排针上的 GPIO）。
+> **I2C 引脚选择**：I2C 使用 P0.26 (SDA) + P1.09 (SCL)，均为 E73 模组上的非 Pro Micro 排针引脚，与键盘矩阵无冲突。外部 5.1KΩ 0402 上拉到 VDD。详见 `imu-sensor-selection.md`。
 
 ## Getting Started
 

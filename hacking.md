@@ -18,9 +18,14 @@ This guide covers using a J-Link debugger to interact with nRF52840 via SWD on m
 - [SuperMini NRF52840 上拉电阻问题](#supermini-nrf52840-上拉电阻问题)
 - [nRF52840 封装对比: aQFN73 vs QFN48](#nrf52840-封装对比-aqfn73-vs-qfn48)
 - [电源控制 (EXT_POWER) 架构](#电源控制-ext_power-架构)
+- [物理电源开关位置选择](#物理电源开关位置选择)
 - [BLE 键盘功耗与续航估算](#ble-键盘功耗与续航估算)
 - [nRF52840 内置 DC-DC / LDO 与 Zephyr 配置](#nrf52840-内置-dc-dc--ldo-与-zephyr-配置)
   - [DC-DC 开关纹波对 BLE 射频的影响](#dc-dc-开关纹波对-ble-射频的影响)
+- [NFC 引脚复用为 GPIO (P0.09/P0.10)](#nfc-引脚复用为-gpio-p009p010)
+- [nRF52840 GPIO 速度等级与背光 PWM 引脚选择](#nrf52840-gpio-速度等级与背光-pwm-引脚选择)
+- [RGB 状态指示 LED 设计](#rgb-状态指示-led-设计)
+- [KeebDeck Mini（Solder Party 官方蓝牙版）](#keebdeck-minisolder-party-官方蓝牙版)
 - [Troubleshooting](#troubleshooting)
 
 ## Hardware Setup
@@ -34,7 +39,7 @@ SWDIO (DIO)  ────  SWDIO
 SWCLK (CLK)  ────  SWCLK
 3V3          ────  VDD
 GND          ────  GND
-RST (optional) ──  nRESET    (recommended - helps recover from sleep/lock)
+RST          ────  nRESET    (必须 - System OFF 时 J-Link 需要此线唤醒芯片)
 ```
 
 > SWDIO and SWCLK are dedicated debug pins on nRF52840, not GPIOs.
@@ -199,10 +204,64 @@ JLinkExe -device NRF52840_XXAA -if SWD -speed 4000 -autoconnect 1
 
 1. Disconnect J-Link
 2. Connect USB-C cable to the board
-3. Double-tap the Reset button/pad
+3. 进入 UF2 Bootloader（三选一）：
+   - **方法 A**：J-Link 通过 SWD RST 线发送两次 reset（自动化脚本）
+   - **方法 B**：如果已有 ZMK 固件运行，按键盘上的 `&bootloader` 组合键（见下方）
+   - **方法 C**：如果板上有 Reset 按钮/焊盘，双击它
 4. A USB drive named `NICENANO` should appear
 5. Copy your `zmk.uf2` file to the drive
 6. Board auto-reboots with new firmware
+
+### 进入 UF2 Bootloader 的推荐方式（无需 Reset 按钮）
+
+keebdeck 不设物理 Reset 按钮，通过以下方式进入 UF2 bootloader：
+
+#### 方式 1：ZMK `&bootloader` 键位（日常使用推荐）
+
+ZMK 内置 `&bootloader` 行为，绑定到键盘 Adjust/System 层，正常打字不会误触：
+
+```
+// 需同时按住两个 layer 键（如 Lower + Raise）激活 Adjust 层
+// Adjust 层左上角 = &sys_reset，右上角 = &bootloader
+
+Adjust Layer (Layer 3):
+┌────────────┬─────┬─────┬─────┬─────┬──────────────┐
+│ &sys_reset │     │     │     │     │ &bootloader  │
+├────────────┼─────┼─────┼─────┼─────┼──────────────┤
+│            │     │     │     │     │              │
+└────────────┴─────┴─────┴─────┴─────┴──────────────┘
+```
+
+此方法等效于双击 Reset — 直接进入 UF2 mass storage 模式。
+
+#### 方式 2：J-Link SWD RST 线（固件崩溃/System OFF 时）
+
+当固件崩溃或芯片处于 System OFF 深度睡眠时，`&bootloader` 无法使用。
+此时通过 SWD 调试座的 RST 线唤醒芯片并重新刷写：
+
+```bash
+# J-Link 可以在任何状态下通过 RST 线唤醒芯片并刷写
+JLinkExe -device NRF52840_XXAA -if SWD -speed 4000 -autoconnect 1
+> r        # reset (通过 RST 线拉低 nRESET)
+> erase
+> loadfile firmware/bootloader/nice_nano_bootloader-0.6.0_s140_6.1.1.hex
+> r
+> g
+> exit
+```
+
+> **重要**：SWD 调试座必须引出 nRESET 线（除 SWDIO/SWCLK/3V3/GND 外的第 5 根线）。
+> 没有 RST 线时，J-Link 在 System OFF 状态下无法连接芯片。
+
+#### 为什么不需要物理 Reset 按钮
+
+| 场景 | 解决方案 |
+|------|---------|
+| 日常刷新固件 | 键盘按 `&bootloader` 组合键 → UF2 拖拽 |
+| 固件崩溃，键盘无响应 | J-Link SWD + RST 线重新刷写 |
+| System OFF 深度睡眠 | J-Link 通过 RST 线唤醒 |
+| 芯片全新空白 | J-Link SWD 直接刷（空白芯片 DAP 默认开启） |
+| APPROTECT 锁定 | J-Link `erase` 命令解锁（擦除全部固件） |
 
 ## Simulate Blank Chip (Full Erase)
 
@@ -377,6 +436,40 @@ Address Range           Size    Description
 | `0x10001200` | PSELRESET[0:1] | Reset pin selection |
 | `0x10001208` | APPROTECT | Access port protection (0xFF=open) |
 | `0x1000120C` | NFCPINS | NFC pin config (0xFE=disabled) |
+
+## NFC 引脚复用为 GPIO (P0.09/P0.10)
+
+### 硬件背景
+
+nRF52840 的 **P0.09 (NFC1)** 和 **P0.10 (NFC2)** 是 13.56 MHz NFC 差分电流驱动端口。这两个引脚在芯片内部连接到 NFC 前端电路，必须成对使用才能驱动 NFC 天线。
+
+### UICR NFCPINS 寄存器控制
+
+这两个引脚的功能由 UICR 寄存器 `NFCPINS`（地址 `0x1000120C`）控制：
+
+| NFCPINS 值 | P0.09/P0.10 功能 | 说明 |
+|-----------|-----------------|------|
+| `0xFFFFFFFF`（默认） | **NFC 天线** | 芯片出厂默认，引脚连接到 NFC 前端 |
+| `0xFFFFFFFE` | **普通 GPIO** | 禁用 NFC，引脚变为标准数字 I/O |
+
+> nice_nano bootloader 在初始化时会自动将 NFCPINS 写为 `0xFFFFFFFE`（禁用 NFC），和设置 REGOUT0=3.3V 是同一段初始化代码。使用 nice_nano bootloader 的板子无需手动配置。
+
+### keebdeck 中的使用
+
+keebdeck 不使用 NFC 功能。UICR 读数确认 NFC 已禁用：
+
+```
+NFC Pins | 0xFFFFFFFE | Disabled (used as GPIO)
+```
+
+这两个引脚在 keebdeck 中被分配为键盘矩阵扫描列线：
+
+| 引脚 | NFC 功能（已禁用） | keebdeck 分配 | Pro Micro 名 |
+|------|------------------|--------------|-------------|
+| **P0.09** | NFC1 | **COL4** | D10 |
+| **P0.10** | NFC2 | **COL5** | D16 |
+
+**结论：P0.09/P0.10 用于键盘矩阵 COL4/COL5 完全没有问题。** NFC 功能通过 UICR 寄存器禁用后，这两个引脚的电气特性与其他 P0.xx GPIO 完全相同——支持全速 I/O、上下拉配置、中断检测等所有标准 GPIO 功能。
 
 ## UF2 Format Notes
 
@@ -725,6 +818,56 @@ v2 方案更简洁：新一代 LDO（XC6220 shutdown <1μA，ME6217 shutdown ~0.
 | **Glove80 LH / RH** | P0.31 / P0.19 | HIGH | 左右手不同引脚 |
 
 > P0.13 是最流行的选择。ACTIVE_LOW 的板子多用 P-FET 方案，ACTIVE_HIGH 的板子多用 LDO CE 方案。
+
+## 物理电源开关位置选择
+
+keebdeck 有一个物理滑动开关用于彻底关机。开关位置有两种方案：
+
+### 方案对比
+
+```
+方案 1：开关接 VBAT（电池正极）
+
+  LiPo B+ ──[开关]──→ TP4054 (BAT) ──→ PMOS 电源选择 ──→ VSYS ──→ nRF52840
+                        充电 IC
+
+  开关断开 → 电池与一切断开，零漏电
+
+
+方案 2：开关接 VSYS（电源选择器输出）  ← 推荐
+
+  LiPo B+ ──→ TP4054 (BAT) ──→ PMOS 电源选择 ──[开关]──→ VSYS ──→ nRF52840
+               充电 IC 始终连接电池
+
+  开关断开 → 仅断开 nRF52840 供电，TP4054 仍连电池
+```
+
+### TP4054 静态漏电分析
+
+> 数据来源：TP4054 Datasheet 电特性表，I_BAT 参数
+
+关键场景：**USB 未接入（V_CC=0V），TP4054 睡眠模式**，BAT 引脚仍连电池。
+
+| 参数 | 条件 | 典型值 | 最大值 | 单位 |
+|------|------|--------|--------|------|
+| I_BAT | 睡眠模式，V_CC=0V | **-1** | **-2** | μA |
+| I_BAT | 待机模式，V_BAT=4.2V（充满） | 0 | -6 | μA |
+| I_BAT | 停机模式，R_PROG 未连接 | ±1 | ±2 | μA |
+
+负号表示电流从电池流向 TP4054（反向漏电）。
+
+### 结论：推荐方案 2（开关接 VSYS）
+
+| | 方案 1：开关接 VBAT | 方案 2：开关接 VSYS |
+|---|---|---|
+| **关机漏电** | 0 μA（完全断开） | ~1-2 μA（TP4054 反向漏电） |
+| **关机时 USB 充电** | **不行**（电池被断开） | **可以**（TP4054 仍连电池） |
+| **110mAh 电池耗尽时间** | ∞（零漏电） | ~6 年（2 μA） |
+| **使用便利性** | 差（关机后忘记开就充不进电） | **好**（随时插线即可充电） |
+
+TP4054 的睡眠漏电仅 1-2 μA，和 nRF52840 深睡眠（~3 μA）是同一量级，对电池寿命影响可忽略。方案 2 多漏的这点电流换来"关机也能充电"，实际使用中方便很多。
+
+> **注意**：方案 2 中，USB 插入时 TP4054 的 V_CC 有电，即使开关断开也会正常给电池充电。充满后 TP4054 自动终止充电（C/10 终止），不需要人工干预。
 
 ## BLE 键盘功耗与续航估算
 
@@ -1328,6 +1471,326 @@ GND  ──────── 电池负极
 | 功耗比预期高 | DTS 中忘记启用 DC-DC | 检查 `regulator-initial-mode` 是否设为 DCDC |
 | QFN48 无法用 High Voltage | VDD/VDDH 内部短接 | QFN48 只能用 Normal Voltage + REG1 DC-DC |
 
+## nRF52840 GPIO 速度等级与背光 PWM 引脚选择
+
+### P0 全速 GPIO vs P1 低频 I/O：为什么有区别？
+
+nRF52840 的 48 个 GPIO 并非完全相同。P0 端口和 P1 端口在硬件实现上有本质区别：
+
+#### 芯片内部架构原因
+
+nRF52840 的 GPIO 分属两个不同的 I/O 端口控制器：
+
+| 端口 | 引脚范围 | I/O 类型 | 最大翻转速率 | 驱动能力 |
+|------|---------|---------|------------|---------|
+| **GPIO P0** | P0.00 ~ P0.31 | **全速 I/O** | 不受限（可达 MHz 级） | Standard + **High drive** |
+| **GPIO P1** (部分) | P1.00, P1.08, P1.09 | **全速 I/O** | 不受限 | Standard + High drive |
+| **GPIO P1** (其余) | P1.01~P1.07, P1.10~P1.15 | **低频 I/O** | **~10 kHz** | **仅 Standard drive** |
+
+> 数据来源：nRF52840 Product Specification v1.7, Table 145/146 "Pin assignment" 中标注 "Low frequency I/O only"
+
+#### 为什么 P1 大部分引脚是低频的？
+
+这是**芯片物理布局（die layout）的限制**，不是软件可以改变的：
+
+1. **走线距离**：P1 低频引脚在芯片 die 上距离 I/O pad ring 更远，寄生电容和走线电阻更大
+2. **驱动器规格**：这些引脚的输出驱动器只实现了 Standard drive（H0S1 模式），没有 High drive（H0H1）选项
+3. **时钟域**：低频 I/O 引脚的采样/驱动经过额外的同步级，限制了最大翻转频率
+
+这是硬件固有特性，**不能通过寄存器配置或固件绕过**。PIN_CNF 寄存器的 DRIVE 字段对这些引脚设置 High drive 无效。
+
+#### 10 kHz 限制意味着什么？
+
+| 应用 | 所需频率 | 低频 I/O 可用？ |
+|------|---------|---------------|
+| 键盘矩阵扫描 | ~100-1000 Hz | 完全可以 |
+| I2C 100kHz/400kHz | 100-400 kHz | **不行**（需要全速引脚） |
+| SPI | 1-8 MHz | **不行** |
+| LED PWM 调光 (200Hz~1kHz) | 200-1000 Hz | 勉强可以，但余量很小 |
+| LED PWM 调光 (高质量 >1kHz) | 1-20 kHz | **边缘/不行** |
+| WS2812 数据线 | 800 kHz | **不行** |
+| UART 115200 | ~115 kHz | **不行** |
+
+> **键盘矩阵扫描**用低频 I/O 引脚完全没问题——keebdeck 的 COL2 (P1.04)、COL3 (P1.06)、COL6 (P1.11)、COL7 (P1.13)、COL8 (P1.15)、COL12 (P1.02) 都是 P1 低频引脚，作为矩阵列线（扫描频率 ~1kHz）毫无问题。
+
+### 背光 LED PWM 引脚选择
+
+#### 电路现状
+
+原理图中 AP3032 升压 LED 驱动 (U1) 的 CTRL 引脚（Pin 4）当前仅有 R4 (4.7kΩ) 下拉到 GND，**尚未连接到 nRF52840 的任何 GPIO**。
+
+AP3032 CTRL 引脚兼具使能和调光功能：
+
+| CTRL 电平 | AP3032 状态 | 电流 |
+|----------|-----------|------|
+| LOW（R4 下拉默认） | **Shutdown** | <1 μA |
+| PWM 信号 | 开启，亮度 = 占空比 | 取决于亮度 |
+| HIGH | 全亮 | 最大 |
+
+只需**一个 GPIO** 即可控制开关和亮度——LOW 关闭，PWM 调光。R4 下拉保证 boot 时默认关闭（安全状态）。
+
+#### 决定：使用 P0.15
+
+**背光 PWM 信号接 nRF52840 的 P0.15。**
+
+选择理由：
+
+| 因素 | P0.15 | P1.xx 低频引脚 |
+|------|-------|---------------|
+| **GPIO 速度** | 全速，PWM 可达 MHz | ≤10 kHz，LED PWM 余量不足 |
+| **驱动能力** | 支持 High drive (5mA) | 仅 Standard drive (1mA) |
+| **ZMK 生态** | nice!nano LED 标准引脚 | 非标准 |
+| **PWM 外设** | nRF52840 PWM 可映射到此 | 能映射但受引脚速度限制 |
+| **冲突** | 不在矩阵 19 引脚内，不在 I2C/IMU 引脚内 | — |
+
+> nRF52840 的 PWM 外设（PWM0~PWM3）通过 PSEL 寄存器可以映射到**任意 GPIO**，但输出信号的实际翻转速率受引脚物理特性限制。PWM 外设配置 16kHz 占空比信号时，P0.15 能忠实输出，P1.03 则可能因为 10kHz 限制而波形失真。
+
+#### 完整背光控制架构
+
+```
+                    P0.13 (EXT_POWER, 可选)
+                        │
+                        ▼ LDO CE（深睡眠时彻底切断 VIN）
+VDDH ── R1(0Ω) ── VIN (AP3032 Pin 6)
+                        │
+                    P0.15 (PWM)  ← 新增连接
+                        │
+                        ▼ CTRL (AP3032 Pin 4)
+                        │
+                    R4(4.7kΩ) 下拉 → GND（boot 时默认 shutdown）
+```
+
+| 模式 | P0.15 | P0.13 | AP3032 | LED |
+|------|-------|-------|--------|-----|
+| 打字中（背光开） | PWM 输出 | HIGH | 工作，升压 | 亮度跟随占空比 |
+| 空闲（背光关） | LOW | HIGH | Shutdown <1μA | 灭 |
+| 深睡眠 | LOW（高阻） | LOW | VIN 断电 0μA | 灭 |
+
+#### ZMK DTS 配置
+
+```dts
+/ {
+    backlight: pwmleds {
+        compatible = "pwm-leds";
+        pwm_led_0: pwm_led_0 {
+            pwms = <&pwm0 0 PWM_MSEC(20) PWM_POLARITY_NORMAL>;
+        };
+    };
+};
+
+&pwm0 {
+    status = "okay";
+    ch0-pin = <15>;  /* P0.15 */
+};
+```
+
+#### keebdeck 引脚速度一览
+
+| 引脚 | 速度等级 | keebdeck 用途 | 备注 |
+|------|---------|-------------|------|
+| P0.08 | 全速 | ROW0 | |
+| P0.06 | 全速 | ROW1 | |
+| P0.17 | 全速 | ROW2 | |
+| P0.20 | 全速 | ROW3 | |
+| P0.22 | 全速 | ROW4 | |
+| P0.24 | 全速 | ROW5 | |
+| P1.00 | **全速** | COL0 | P1 中少数全速引脚 |
+| P0.11 | 全速 | COL1 | |
+| P1.04 | 低频 | COL2 | 矩阵扫描 ~1kHz，够用 |
+| P1.06 | 低频 | COL3 | 同上 |
+| P0.09 | 全速 | COL4 | NFC1 已禁用 |
+| P0.10 | 全速 | COL5 | NFC2 已禁用 |
+| P1.11 | 低频 | COL6 | 矩阵扫描够用 |
+| P1.13 | 低频 | COL7 | 同上 |
+| P1.15 | 低频 | COL8 | 同上 |
+| P0.02 | 全速 | COL9 | |
+| P0.29 | 全速 | COL10 | |
+| P0.31 | 全速 | COL11 | |
+| P1.02 | 低频 | COL12 | 飞线，矩阵扫描够用 |
+| P0.26 | 全速 | I2C SDA | 需全速（400kHz） |
+| P1.09 | **全速** | I2C SCL | P1 中少数全速引脚 |
+| P0.03 | 全速 | IMU INT（可选） | |
+| P0.13 | 全速 | EXT_POWER | LDO CE 控制 |
+| **P0.15** | **全速** | **背光 PWM** | **AP3032 CTRL** |
+
+## RGB 状态指示 LED 设计
+
+### 为什么不用 WS2812？
+
+WS2812 (Neopixel) 内部有恒流源和控制 IC，**关闭时仍有 ~1mA 静态功耗**。对 BLE 键盘（sleep 态 <10μA）来说这是不可接受的。分立 RGB LED 在 GPIO 输出 LOW 时电流为 **0μA**。
+
+### 引脚选择
+
+从未使用的全速 GPIO 中选取三个相邻引脚（aQFN73 AC 列，物理位置紧凑，便于 PCB 走线）：
+
+| 颜色 | GPIO | aQFN73 Ball | 速度 |
+|------|------|-------------|------|
+| Red | P0.14 | AC12 | 全速 |
+| Green | P0.16 | AC14 | 全速 |
+| Blue | P0.19 | AC18 | 全速 |
+
+三个引脚均为 P0 全速 GPIO，支持 High drive，PWM 调光无限制。
+
+### 限流电阻计算
+
+VDD = 3.3V（REGOUT0），目标电流 ~1mA（中等偏低亮度，状态指示足够醒目且不刺眼）。
+
+所选 LED Vf 参数（datasheet @If=20mA）：
+
+| 颜色 | Vf min | Vf max | Vf @1mA (估) |
+|------|--------|--------|-------------|
+| Red | 1.8V | 2.4V | ~1.7~2.0V |
+| Green | 2.8V | 3.6V | ~2.5~3.2V |
+| Blue | 2.8V | 3.6V | ~2.5~3.2V |
+
+> Vf 随电流指数下降，1mA 时比 20mA 额定值低 ~0.2-0.4V。
+
+| 颜色 | 电阻 (E24) | Vf @1mA 典型 | 实际电流 | 单色功耗 |
+|------|-----------|-------------|---------|---------|
+| **Red** | **1.5kΩ** | ~1.8V | 1.0mA | 3.3mW |
+| **Green** | **470Ω** | ~2.8V | 1.06mA | 3.5mW |
+| **Blue** | **470Ω** | ~2.8V | 1.06mA | 3.5mW |
+
+绿/蓝 470Ω 在不同 Vf 下的电流变化：
+
+| Vf @1mA | 电流 (470Ω) | 效果 |
+|---------|------------|------|
+| 2.6V（偏低） | 1.49mA | 稍亮 |
+| 2.8V（典型） | 1.06mA | 目标亮度 |
+| 3.0V（偏高） | 0.64mA | 变暗但可见 |
+| 3.2V（极端） | 0.21mA | 很暗但不灭 |
+
+> 三色全亮（白色混光）总功耗 ~10mW，对电池续航几乎无影响。
+
+#### 电路拓扑（共阴极）
+
+```
+P0.14 ──┤1.5kΩ├── RED   anode ──┐
+P0.16 ──┤470Ω ├── GREEN anode ──┤── (共阴) ── GND
+P0.19 ──┤470Ω ├── BLUE  anode ──┘
+```
+
+选择共阴极的理由：nRF52840 GPIO 复位后默认输出 LOW，共阴极下 LOW = 灭（安全状态）。共阳极则会在 boot 阶段 GPIO 配置为输出后、固件拉高之前短暂点亮 LED。
+
+#### 绿/蓝 headroom 注意
+
+3.3V 供电下绿/蓝 Vf max 可达 3.6V（@20mA），超过 VDD。但 1mA 时 Vf 显著降低，大多数样品能正常工作。如遇到个别不亮的情况：
+
+- 换一颗 Vf 偏低的 LED（同批次内有离散性）
+- 或将电阻减小到 **330Ω**（增加电流裕量）
+
+#### 视觉亮度匹配
+
+红色 LED 发光效率通常高于蓝/绿，1mA 红色看起来可能比 1mA 绿/蓝更亮。如需视觉亮度一致，可将红色电阻加大到 **2kΩ**（~0.65mA）。实际调试时按目视效果微调即可，三路独立电阻正是分立 RGB 的优势。
+
+### 为什么蓝色和绿色 LED 的 Vf 几乎一样？
+
+这是一个好问题。蓝色 LED 发明极晚（中村修二，2014 年诺贝尔物理学奖），直觉上蓝光光子能量更高，Vf 应该比绿色更高。但实际数据表上蓝色和绿色 Vf 都是 ~3.0V，原因如下：
+
+#### 半导体材料体系才是关键
+
+LED 的 Vf 主要取决于材料的**带隙 (Bandgap)** 加上 **接触电阻、欧姆损耗等额外压降**：
+
+| 颜色 | 波长 | 光子能量 | 材料体系 | 带隙 Eg | 典型 Vf |
+|------|------|---------|---------|---------|---------|
+| **红色** | 620-630 nm | ~2.0 eV | **AlGaInP** | ~1.9 eV | **1.8-2.2V** |
+| **绿色（传统）** | 565 nm | ~2.2 eV | **GaP** (掺氮) | ~2.26 eV | **2.0-2.2V** |
+| **绿色（现代高亮）** | 520-530 nm | ~2.4 eV | **InGaN** | ~2.4 eV | **2.8-3.2V** |
+| **蓝色** | 450-470 nm | ~2.7 eV | **InGaN** | ~2.7 eV | **2.8-3.2V** |
+
+关键发现：**现代绿色 LED 和蓝色 LED 用的是同一种材料——InGaN（氮化铟镓）！**
+
+#### 为什么 Vf 如此接近？
+
+1. **同一材料体系**：现代高亮绿色 LED 不再用老式 GaP，而是用 InGaN。蓝色 LED 也是 InGaN。两者只是**铟 (In) 的掺杂比例不同**——铟含量越高，带隙越窄，发光越偏绿
+2. **带隙差异被压降抵消**：蓝色 InGaN 的 Eg (~2.7eV) 确实比绿色 InGaN (~2.4eV) 高 ~0.3eV，但绿色 InGaN 因为铟含量更高，晶格失配更严重，缺陷密度更高，导致**欧姆损耗和接触电阻更大**，额外压降反而更高
+3. **净效果**：蓝色的「更高带隙」和绿色的「更高寄生压降」恰好接近抵消，最终 Vf 落在相似的 3.0V 左右
+
+#### 红色 LED 为什么 Vf 明显低？
+
+红色 LED 使用完全不同的材料体系 AlGaInP（磷化铝镓铟），它是 **III-V 族磷化物**，带隙天生就低 (~1.9eV)，加上这种材料体系非常成熟，接触电阻和欧姆损耗都很小，所以 Vf 只有 ~2.0V。
+
+#### 那个难以发明的「老绿色」LED 去哪了？
+
+传统 GaP 绿色 LED（Vf ~2.1V）仍然存在，但它发的是暗淡的黄绿色（565nm），亮度远不如 InGaN 绿色。现代 RGB LED 封装里的「Green」几乎全部换成了 InGaN（纯绿 520nm），所以你在 datasheet 上看到绿色和蓝色 Vf 一样高——因为它们本质上是**同一种半导体，只是调了铟的比例**。
+
+> **总结**：三路电阻值不同（1.2kΩ / 330Ω / 330Ω）正是因为红色用 AlGaInP（Vf 低），绿蓝都用 InGaN（Vf 高且接近）。这不是巧合，是材料物理决定的。
+
+### 状态指示方案
+
+| 状态 | 颜色 | GPIO 输出 | 模式 |
+|------|------|----------|------|
+| BLE 广播中（未配对） | 蓝色慢闪 | P0.19 1Hz | 闪烁 |
+| BLE 已连接 | 蓝色常亮 1s 后灭 | P0.19 短亮 | 单次 |
+| USB 已连接 | 绿色常亮 | P0.16 HIGH | 常亮 |
+| 充电中 | 红色呼吸灯 | P0.14 PWM | 渐变 |
+| 充电完成 | 绿色常亮 | P0.16 HIGH | 常亮 |
+| 电量低 (<15%) | 红色闪烁 | P0.14 2Hz | 闪烁 |
+| 配对模式 | 蓝白交替 | P0.19 + 全部 | 交替 |
+| 固件错误 | 红色快闪 | P0.14 5Hz | 快闪 |
+
+## KeebDeck Mini（Solder Party 官方蓝牙版）
+
+KeebDeck Mini 是 Solder Party 推出的 **BBQ20KBD 后继产品**，是 KeebDeck 系列中的蓝牙无线版本。
+
+### 基本信息
+
+| 项目 | 值 |
+|------|-----|
+| MCU | **nRF52833**（BLE 5，注意不是 nRF52840） |
+| 键盘 | 69 键硅胶键帽（KeebDeck Keyboard 模块，85×48mm） |
+| 指向设备 | 光学拇指传感器（USB HID 鼠标） |
+| 连接方式 | **BLE 无线 + USB** |
+| 背光 | 有（背光按键） |
+| 外壳 | 注塑外壳，内置 LiPo 电池仓 |
+| 接口 | USB 连接器、Qwiic、PMOD 兼容 I2C 排针 |
+| 电源开关 | 有 |
+
+### 与 KeebDeck Basic 的区别
+
+| | Mini | Basic |
+|---|---|---|
+| MCU | **nRF52833** (BLE) | STM32F042 |
+| 连接 | BLE 无线 + USB | 仅 USB |
+| 外壳 | 注塑外壳 + 电池仓 | 无外壳 |
+| 指向设备 | 光学拇指传感器 | 无 |
+| 背光 | 有 | 无 |
+
+### nRF52833 vs nRF52840
+
+KeebDeck Mini 用的是 nRF52833，和本项目（keebdeck_ble）使用的 nRF52840 有以下差异：
+
+| | nRF52833 | nRF52840 |
+|---|---|---|
+| Flash | 512 KB | 1 MB |
+| RAM | 128 KB | 256 KB |
+| BLE | 5.1 | 5.0 |
+| USB | **无**（芯片无 USB 硬件） | 有 USB 2.0 Full-Speed（片内控制器） |
+| 封装 | QFN40 (5×5mm), aQFN94 (7×7mm) | QFN48 (6×6mm), aQFN73 (7×7mm) |
+| GPIO | 最多 42 (aQFN94) | 最多 48 (aQFN73) |
+| High Voltage 模式 | 支持 (aQFN94) | 支持 (aQFN73) |
+| SoftDevice | S140 v7.x | S140 v6.x / v7.x |
+
+> nRF52833 芯片内没有 USB 控制器。KeebDeck Mini 板上的 USB 连接器最可能用途是 LiPo 充电（+ 可能通过外部 USB-UART 桥接芯片做串口调试），所有键盘数据通过 BLE 传输。这也意味着 Mini 无法像 nRF52840 那样使用 UF2 U盘拖拽烧录，固件更新需走 BLE DFU 或 SWD。
+
+### 官方资源
+
+| 资源 | URL |
+|------|-----|
+| 产品页 | https://www.solder.party/keeb/ |
+| Instagram（KiCon 展示） | https://www.instagram.com/p/DOgE6x5jJyj/ |
+| KeebDeck Keyboard 硬件 | https://github.com/solderparty/keebdeck_keyboard_hw |
+| KeebDeck Basic 硬件 | https://github.com/solderparty/keebdeck_basic_hw |
+
+### 开源状态（截至 2026-04）
+
+- **KeebDeck Keyboard**（键帽模块）：硬件开源，KiCad/Altium/Eagle/EasyEDA 格式，License: CERN OHL v1.2
+- **KeebDeck Basic**：硬件开源，含原理图 PDF
+- **KeebDeck Mini**：**硬件尚未开源**，无 `keebdeck_mini_hw` 仓库
+- **销售状态**：尚未在 Lectronz / Tindie 上架，2025-09 在 KiCon 大会上展示过原型
+
+---
+
 ## Troubleshooting
 
 ### "No probes connected via USB"
@@ -1341,10 +1804,10 @@ GND  ──────── 电池负极
 - All scripts in this repo use `JLinkExe`
 
 ### Can't connect to target
-- Verify SWD wiring (SWDIO, SWCLK, GND, VCC)
-- Try connecting RST line
+- Verify SWD wiring (SWDIO, SWCLK, GND, VCC, **RST**)
+- **RST 线是必须的**：芯片在 System OFF 深度睡眠时，SWD 无法连接，J-Link 需要通过 RST 线拉低 nRESET 唤醒芯片
 - Check VTref voltage in JLinkExe output (should be ~3.3V)
-- If chip is in deep sleep, RST connection is needed
+- keebdeck 无物理 Reset 按钮，完全依赖 SWD 座的 RST 线
 
 ### APPROTECT is enabled (reads as 0x00)
 - Chip is read-protected, can't dump firmware
