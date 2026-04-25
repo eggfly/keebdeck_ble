@@ -175,9 +175,10 @@ Blank nRF52840 (0xFF)
     │
     ▼  JLink SWD
     │
-    ├── Step 1: Flash bootloader hex (includes MBR + SoftDevice + Bootloader)
-    │            nice_nano_bootloader-0.6.0_s140_6.1.1.hex
+    ├── Step 1: Flash bootloader hex (includes MBR + SoftDevice + Bootloader + UICR)
+    │            nice_nano_bootloader-0.10.0_s140_6.1.1.hex
     │
+    ▼  Bootloader 首次运行: 检测 REGOUT0，写入 3.3V，自动重启
     ▼  Now USB works! Double-tap reset → NICENANO USB drive appears
     │
     └── Step 2: Copy zmk.uf2 to NICENANO drive
@@ -187,19 +188,96 @@ Blank nRF52840 (0xFF)
 ### Flashing Commands
 
 ```bash
-# Option A: Use the script
-./jlink-scripts/05-flash-hex.sh firmware/bootloader/nice_nano_bootloader-0.6.0_s140_6.1.1.hex
+# Option A: Use the script (推荐)
+./jlink-scripts/05-flash-hex.sh firmware/bootloader/nice_nano_bootloader-0.10.0_s140_6.1.1.hex
 
 # Option B: Manual JLinkExe
 JLinkExe -device NRF52840_XXAA -if SWD -speed 4000 -autoconnect 1
 > erase
-> loadfile firmware/bootloader/nice_nano_bootloader-0.6.0_s140_6.1.1.hex
+> loadfile firmware/bootloader/nice_nano_bootloader-0.10.0_s140_6.1.1.hex
 > r
 > g
 > exit
 ```
 
-> **Important**: The `nice_nano_bootloader-0.6.0_s140_6.1.1.hex` file is a **merged hex** that contains MBR + SoftDevice S140 v6.1.1 + Bootloader all in one file. You only need to flash this single file.
+> **Important**: The `nice_nano_bootloader-0.10.0_s140_6.1.1.hex` file is a **merged hex** that contains MBR + SoftDevice S140 v6.1.1 + Bootloader + **UICR 数据** all in one file. You only need to flash this single file.
+
+### ⚠️ 警告：不要用 loadbin 刷 Flash dump 替代 hex 刷机流程
+
+> **严重问题**：如果用 `loadbin dump.bin 0x0` 刷入全 Flash dump（而不是 `loadfile bootloader.hex`），**UICR 不会被写入**！这会导致：
+>
+> 1. **Bootloader 地址丢失** (UICR 0x10001014 = 0xFFFFFFFF) — MBR 找不到 bootloader，Fn+B 进 bootloader 失败
+> 2. **REGOUT0 = 1.8V** (UICR 0x10001304 = 0xFFFFFFFF) — VDD 电压错误，LED 闪烁异常，外设不稳定
+> 3. **MBR Params 地址丢失** (UICR 0x10001018 = 0xFFFFFFFF) — DFU 升级无法工作
+>
+> **根因**：`loadbin` 命令将 bin 文件写入 Flash 地址空间 (0x00000000-0x000FFFFF)。UICR 位于 0x10001000-0x100013FF，不在 Flash 地址范围内，所以 bin 文件不包含也不会写入 UICR。而 Intel hex 文件通过 Extended Linear Address Record 可以包含任意地址的数据（包括 UICR 地址段）。
+>
+> **正确的刷机方式（必须按顺序）**：
+>
+> ```bash
+> # Step 1: 必须先刷 bootloader hex（写入 Flash + UICR）
+> ./jlink-scripts/05-flash-hex.sh firmware/bootloader/nice_nano_bootloader-0.10.0_s140_6.1.1.hex
+>
+> # Step 2: 等待 bootloader 首次运行（自动写 REGOUT0=3.3V 并重启）
+> # Step 3: 通过 USB 拖入 zmk.uf2（只写 App 区域，不碰 UICR）
+> ```
+>
+> **如果已经用 loadbin 刷错了**，补救方法：
+>
+> ```bash
+> # 重新刷一次 bootloader hex（不需要 erase，hex 会覆盖对应区域并写入 UICR）
+> JLinkExe -device NRF52840_XXAA -if SWD -speed 4000 -autoconnect 1
+> > loadfile firmware/bootloader/nice_nano_bootloader-0.10.0_s140_6.1.1.hex
+> > r
+> > g
+> > exit
+> # App 区域 (0x26000-0xF3FFF) 的 ZMK 固件不会被覆盖
+> ```
+
+### UICR 写入时机详解（源码验证）
+
+nice_nano bootloader v0.10.0 中 UICR 相关字段的写入分两个阶段：
+
+**阶段 1：JLink `loadfile` hex 文件时（硬件写入）**
+
+hex 文件 (`nice_nano_bootloader-0.10.0_s140_6.1.1.hex`) 包含 UICR 地址段的 8 字节数据：
+
+| UICR 地址 | 值 | 含义 |
+|-----------|-----|------|
+| `0x10001014` | `0x000F4000` | Bootloader 起始地址（MBR 用此跳转到 bootloader） |
+| `0x10001018` | `0x000FE000` | MBR Params 页地址（DFU 升级用） |
+
+这两个值由 hex 文件携带，`loadfile` 命令写入。**`loadbin` 命令无法写入这些值。**
+
+**阶段 2：Bootloader 首次运行时（代码写入）**
+
+Bootloader 启动时执行 `board_setup()` (`src/boards/boards.c:119-138`)：
+
+```c
+// nice_nano/board.h 中定义:
+#define UICR_REGOUT0_VALUE UICR_REGOUT0_VOUT_3V3
+
+// boards.c 中执行:
+#ifdef UICR_REGOUT0_VALUE
+  if (REGOUT0 == 默认值 0x7) {
+    写入 REGOUT0 = 3.3V;     // UICR 0x10001304
+    NVIC_SystemReset();       // 重启生效
+  }
+#endif
+```
+
+| UICR 地址 | 值 | 含义 | 写入条件 |
+|-----------|-----|------|---------|
+| `0x10001304` | `0xFFFFFFFD` (3.3V) | VDD 输出电压 | 仅当当前值为默认 0xFFFFFFFF (1.8V) 时写入 |
+
+**不由 bootloader 写入的字段（来源于其他固件或手动配置）：**
+
+| UICR 地址 | 字段 | nice_nano bootloader 是否写入 |
+|-----------|------|---------------------------|
+| `0x10001200` | PSELRESET[0] | ❌ 不写入。需要手动配置或由其他固件设置 |
+| `0x10001204` | PSELRESET[1] | ❌ 不写入 |
+| `0x1000120C` | NFCPINS | ❌ 不写入 |
+| `0x10001208` | APPROTECT | ❌ 不写入 |
 
 ### After Flashing Bootloader
 
@@ -2514,11 +2592,13 @@ ZMK 固件（基于 nice!nano bootloader v0.10.0 + SoftDevice S140 v6.1.1）的 
 
 ### 刷写方式选择
 
-| 方式 | 影响范围 | NVS 数据 | 适用场景 |
-|------|---------|---------|---------|
-| **UF2 拖拽** | 仅 App 区域 (0x26000-0x5BFFF) | **保留** | 日常固件更新，保持配对 |
-| **JLink 刷全 Flash dump** | 整个 1MB Flash | 被覆盖，首次启动自动修正 | 恢复/克隆完整环境 |
-| **JLink 刷 bootloader hex** | MBR + SoftDevice + Bootloader | 不影响 App 区域的 NVS | 重建 bootloader |
+| 方式 | 影响范围 | UICR | NVS 数据 | 适用场景 |
+|------|---------|------|---------|---------|
+| **UF2 拖拽** | 仅 App 区域 (0x26000-0x5BFFF) | 不碰 | **保留** | 日常固件更新，保持配对 |
+| **JLink `loadfile` hex** | MBR + SoftDevice + Bootloader + UICR | **写入** bootloader 地址 | 不影响 NVS | 新板子首次刷写（推荐） |
+| **JLink `loadbin` bin dump** | 整个 1MB Flash (0x0-0xFFFFF) | ⚠️ **不碰 UICR** | 被覆盖 | ⚠️ 仅适合 UICR 已正确配置的板子 |
+
+> ⚠️ **`loadbin` 不写 UICR！** 如果之前做过 `erase`（擦除含 UICR），必须先 `loadfile` bootloader hex 写入 UICR，再刷 app。直接 `loadbin` 全 Flash dump 会导致 bootloader 地址丢失、VDD 电压错误。详见上方「警告：不要用 loadbin 刷 Flash dump 替代 hex 刷机流程」。
 
 ### 实测验证（2026-04-25）
 
