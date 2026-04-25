@@ -233,6 +233,32 @@ JLinkExe -device NRF52840_XXAA -if SWD -speed 4000 -autoconnect 1
 ```
 
 > **1.8V vs 3.3V 省电分析**：REG0 DC-DC 将 VDDH (3.0-4.2V) 降到 VDD 时，1.8V 输出的转换效率略高于 3.3V（压差更大，DC-DC 工作在更高效的占空比区间）。但对 BLE 键盘来说，RF 和 CPU 功耗主要由 REG1 核心级 (1.3V) 决定，VDD 电压对总功耗影响约 2-5%。选 1.8V 的前提是所有外设（LED、传感器、OLED）都支持 1.8V I/O 电平。
+>
+> ⚠️ **nice!nano bootloader v0.10.0 会强制写 REGOUT0=3.3V**：bootloader 代码 `boards.c` 中，只要检测到 REGOUT0 为默认值 (0xFFFFFFFF=1.8V) 就会写入 3.3V 并重启。因此即使 hex 文件中不包含 REGOUT0 数据，只要 bootloader 运行过一次，VDD 就会变成 3.3V。想保持 1.8V 需要修改 bootloader 源码去掉 `UICR_REGOUT0_VALUE` 宏。
+>
+> ⚠️ **1.8V 下 RGB LED 不可用**：绿色和蓝色 LED (InGaN) 的 Vf ≈ 2.8V，远高于 1.8V VDD，完全无法点亮。红色 LED (AlGaInP) 的 Vf ≈ 1.8V，也几乎无余量。keebdeck 有 RGB LED，**必须使用 3.3V**。
+
+### UICR 擦除与 REGOUT0 切换
+
+UICR 是 NVM（非易失存储），只能将 bit 从 1 写为 0，不能反向。因此 `0xFFFFFFFD` (3.3V) 无法直接写回 `0xFFFFFFFF` (1.8V)，必须先擦除整个 UICR page。
+
+普通的 JLink `erase` 命令**只擦 Flash，不擦 UICR**。要擦除 UICR 需要通过 NVMC 寄存器操作：
+
+```bash
+# 一步完成：擦除 UICR + 刷入带正确 UICR 的 hex
+JLinkExe -device NRF52840_XXAA -if SWD -speed 4000 -autoconnect 1
+> h                              # halt CPU
+> w4 0x4001E504 2                # NVMC.CONFIG = EEN (擦除使能)
+> w4 0x4001E514 1                # NVMC.ERASEUICR = 1 (触发 UICR page 擦除)
+> sleep 100                      # 等待擦除完成
+> w4 0x4001E504 0                # NVMC.CONFIG = REN (恢复只读)
+> loadfile cyberfly_zmk_full_3v3.hex   # 写入 Flash + UICR (含 REGOUT0=3.3V)
+> r
+> g
+> exit
+```
+
+此方法经实测验证：擦除 UICR 后 REGOUT0 恢复为 0xFFFFFFFF，`loadfile` 写入 hex 中的 UICR 数据后变为 0xFFFFFFFD (3.3V)。Flash 代码区如果已是相同固件则只写 UICR 部分（8KB），速度很快。
 
 ### ⚠️ 警告：不要用 loadbin 刷 Flash dump 替代 hex 刷机流程
 
