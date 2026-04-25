@@ -25,6 +25,7 @@ This guide covers using a J-Link debugger to interact with nRF52840 via SWD on m
 - [NFC 引脚复用为 GPIO (P0.09/P0.10)](#nfc-引脚复用为-gpio-p009p010)
 - [nRF52840 GPIO 速度等级与背光 PWM 引脚选择](#nrf52840-gpio-速度等级与背光-pwm-引脚选择)
 - [RGB 状态指示 LED 设计](#rgb-状态指示-led-设计)
+- [nRF52840 芯片版本 (Build Code) 与选型](#nrf52840-芯片版本-build-code-与选型)
 - [KeebDeck Mini（Solder Party 官方蓝牙版）](#keebdeck-minisolder-party-官方蓝牙版)
 - [Troubleshooting](#troubleshooting)
 
@@ -1625,9 +1626,9 @@ WS2812 (Neopixel) 内部有恒流源和控制 IC，**关闭时仍有 ~1mA 静态
 
 | 颜色 | GPIO | aQFN73 Ball | 速度 |
 |------|------|-------------|------|
-| Red | P0.14 | AC12 | 全速 |
-| Green | P0.16 | AC14 | 全速 |
-| Blue | P0.19 | AC18 | 全速 |
+| Red | P0.14 | AC9 | 全速 |
+| Green | P0.16 | AC11 | 全速 |
+| Blue | P0.19 | AC15 | 全速 |
 
 三个引脚均为 P0 全速 GPIO，支持 High drive，PWM 调光无限制。
 
@@ -1728,6 +1729,98 @@ LED 的 Vf 主要取决于材料的**带隙 (Bandgap)** 加上 **接触电阻、
 | 电量低 (<15%) | 红色闪烁 | P0.14 2Hz | 闪烁 |
 | 配对模式 | 蓝白交替 | P0.19 + 全部 | 交替 |
 | 固件错误 | 红色快闪 | P0.14 5Hz | 快闪 |
+
+## nRF52840 芯片版本 (Build Code) 与选型
+
+### 料号解码
+
+nRF52840 的完整料号格式（数据来源：Product Specification v1.7, Chapter 10）：
+
+```
+nRF52840 - <PP> <VV> - <H><P><F> - <CC>
+            │    │      │  │  │     └── 包装：R7=7寸编带, R=13寸编带, T=托盘
+            │    │      │  │  └──────── 预烧固件版本：0=空片, A-N/P-Z=有预烧固件
+            │    │      │  └─────────── 产线配置：0-9=量产, A-Z=工程
+            │    │      └────────────── 硬件版本：A-Z 递增（A→B→C→D→E→F...）
+            │    └───────────────────── 功能变体：AA=标准, AA-F=APPROTECT 硬件+软件控制
+            └────────────────────────── 封装：QI=aQFN73, QF=QFN48, CK=WLCSP
+```
+
+| 代码 | 含义 | 可选值 |
+|------|------|--------|
+| PP (封装) | Package | QI=aQFN73 (7×7mm, 73 ball), QF=QFN48 (6×6mm), CK=WLCSP (3.5×3.6mm) |
+| VV (变体) | Function variant | AA=1MB Flash/256KB RAM, AA-F=同 AA 但 APPROTECT 由硬件+软件共同控制 |
+| H (硬件版本) | Hardware revision | A→B→C→D→E→F（递增，字母越大越新） |
+| P (产线) | Production config | 0=标准量产 |
+| F (固件) | Preprogrammed FW | 0=空片（最常见） |
+| CC (包装) | Container | R7=7" Reel, R=13" Reel, T=Tray |
+
+### FICR INFO.VARIANT 寄存器
+
+芯片的 build code 烧录在 FICR `INFO.VARIANT` 寄存器（地址 `0x10000104`），以 ASCII 编码：
+
+| VARIANT 值 | 十六进制 | 硬件版本 | 类型 |
+|-----------|---------|---------|------|
+| AAAA | 0x41414141 | Eng **A** | 工程样品 |
+| AABB | 0x41414242 | Eng **B** | 工程样品 |
+| AACA | 0x41414341 | Eng **C** | 工程样品 |
+| **AAC0** | 0x41414330 | Eng **C** | **量产** |
+| AADA | 0x41414441 | Eng **D** | 工程样品 |
+| **AAD0** | 0x41414430 | Eng **D** | **量产** |
+| AAD1 | 0x41414431 | Eng **D** | 量产变体 1 |
+| AAEA | 0x41414541 | Eng **E** | 工程样品 |
+| **AAF0** | 0x41414530 | Eng **F** | **量产** |
+| AAFA | 0x41414641 | Eng **F** | 工程样品 |
+
+> 读取方法：`JLinkExe > mem32 0x10000104 1`
+> 例：读到 `0x41414430` → ASCII "AAD0" → Engineering Revision D, 量产版
+
+### 丝印格式
+
+芯片顶部丝印中的 build code（如 **QIAAC0** 或 **QIAAD0**）：
+
+```
+QIAA D0
+│ │  └── Build code 最后两位（H + P）
+│ └───── VV = AA（功能变体）
+└─────── PP = QI（aQFN73 封装）
+```
+
+### 选型建议
+
+**数据来源：Product Specification v1.7 修订记录（v1.6, November 2021）明确声明：**
+
+> ⚠️ **"Build codes Dxx not recommended for new designs"**
+
+| 硬件版本 | 丝印示例 | 状态 | 说明 |
+|---------|---------|------|------|
+| Eng A / B | QIAAAA, QAABB | 早期工程样品 | 不可用于产品 |
+| **Eng C** | **QIAAC0** | 曾经的量产版 | 较老，errata 较多 |
+| **Eng D** | **QIAAD0** | ⚠️ **不推荐新设计** | Nordic 明确声明 Dxx 不推荐 |
+| **Eng E** | QIAAEA | 较新 | — |
+| **Eng F** | **QIAAF0** | ✅ **推荐新设计** | 目前最新量产版本 |
+
+> **重要纠正**：D0 并不比 C0 "更好"。Nordic 在 PS v1.6 中明确标注 Dxx 不推荐用于新设计，可能是因为 D 系列引入了新的 errata 或回归 bug。新设计应采购 **Exx 或 Fxx** build code。
+
+### keebdeck 现有开发板
+
+keebdeck 的 ProMicro NRF52840 开发板 FICR 读数为 **AAD0**（Eng D, production）：
+
+```
+INFO.VARIANT = 0x41414430 → "AAD0"
+```
+
+D0 用于开发和验证没有问题，ZMK/SoftDevice 的 errata workaround 会自动处理已知硬件 bug。但 keebdeck 最终量产 PCB 采购裸片时，应指定 **AAF0** (QIAA-F-R7) build code。
+
+### C0 vs D0 vs F0 差异
+
+各版本的区别主要体现在 **Errata（硬件勘误）** 数量不同。Nordic SDK (`nrf52_erratas.h`) 通过读取 FICR 内部寄存器 `0x10000130` / `0x10000134` 在运行时检测芯片版本，自动启用对应的 workaround。
+
+nRF52840 的 errata 涵盖 USB、Radio、QSPI、POWER 等模块，具体列表见：
+- Nordic Errata 文档：`docs.nordicsemi.com/bundle/errata_nRF52840_Rev3/`
+- SDK 源码：`nrfx/bsp/stable/mdk/nrf52_erratas.h`
+
+对于 keebdeck 使用的功能（BLE、GPIO、PWM、I2C），各版本差异很小，主要影响在 USB 和 QSPI 等高级外设。
 
 ## KeebDeck Mini（Solder Party 官方蓝牙版）
 
@@ -2375,3 +2468,42 @@ ZMK 文档明确提到了这个问题，建议受影响的 macOS 用户使用 `C
 ✅ 驱动：zmk,battery-nrf-vddh，零 BOM 成本
 ⚠️ macOS：可能会唤醒睡眠，必要时 CONFIG_BT_BAS=n
 ```
+
+## JLink 全 Flash 刷写与 bt/hash 机制
+
+### bt/hash 是什么
+
+Zephyr 蓝牙栈在首次启动时，从芯片 FICR 中读取硬件唯一的 BLE 身份地址，计算一个哈希值，写入 NVS 的 `bt/hash` 键。每次后续启动都会重新计算并与 NVS 中存储的值对比。
+
+### 跨芯片刷写时的自动修复
+
+如果将 A 芯片的全 Flash dump 通过 JLink 刷入 B 芯片，B 芯片首次启动时会发现：
+
+- NVS 中的 `bt/hash` = A 芯片的哈希值
+- 实际计算出的哈希 = B 芯片的哈希值（FICR 不同）
+- **两者不一致 → Zephyr 自动清除所有旧 BLE 配对数据，写入新的 bt/hash**
+
+因此 JLink 全 Flash 刷写到不同芯片是安全的，不会导致 BLE 配对错乱，只是旧的配对信息会丢失（需要重新配对）。
+
+### NVS 存储位置
+
+ZMK 固件（基于 nice!nano bootloader v0.10.0 + SoftDevice S140 v6.1.1）的 NVS 区域位于 `0xEC000`，存储以下 BLE 相关数据：
+
+| NVS 键 | 内容 | 何时写入 |
+|--------|------|---------|
+| `bt/hash` | BLE 身份地址哈希 | 首次启动 |
+| `bt/keys/<mac>` | BLE 配对密钥（LESC、IRK 等） | 配对时 |
+| `bt/ccc/<mac>` | GATT CCC（通知订阅状态） | 配对时 |
+| `ble/profiles/N` | ZMK BLE profile 绑定信息 | 配对时 |
+
+### 刷写方式选择
+
+| 方式 | 影响范围 | NVS 数据 | 适用场景 |
+|------|---------|---------|---------|
+| **UF2 拖拽** | 仅 App 区域 (0x26000-0x5BFFF) | **保留** | 日常固件更新，保持配对 |
+| **JLink 刷全 Flash dump** | 整个 1MB Flash | 被覆盖，首次启动自动修正 | 恢复/克隆完整环境 |
+| **JLink 刷 bootloader hex** | MBR + SoftDevice + Bootloader | 不影响 App 区域的 NVS | 重建 bootloader |
+
+### 实测验证（2026-04-25）
+
+在 Board 2 上实测：JLink 刷入全 Flash dump → UF2 拖入 ZMK → BLE 配对 → 再次 dump 对比，确认仅 `0xEC000` 一个 NVS page 发生变化（229 字节），代码区完全不变。

@@ -45,7 +45,7 @@ Used: 192KB / 1024KB (18%)
 | Field | Value | Description |
 |-------|-------|-------------|
 | Part Number | `0x00052840` | nRF52840 |
-| Package | `0x41414430` (AAD0) | QFN48 |
+| Build Code | `0x41414430` (AAD0) | Eng Revision D, production（⚠️ Dxx 不推荐新设计，新采购应选 F0） |
 | RAM | 256KB | |
 | APPROTECT | `0xFFFFFFFF` | Not locked (SWD open) |
 | NFC Pins | `0xFFFFFFFE` | Disabled (used as GPIO) |
