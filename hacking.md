@@ -208,8 +208,31 @@ JLinkExe -device NRF52840_XXAA -if SWD -speed 4000 -autoconnect 1
 |------|------|------|
 | `nice_nano_bootloader-0.10.0_s140_6.1.1.hex` | Adafruit 原版: MBR + SoftDevice + Bootloader + UICR (bootloader addr + MBR params) | 可用，但 REGOUT0 需要 bootloader 运行时写入 |
 | **`nice_nano_bootloader-0.10.0_s140_6.1.1_patched.hex`** | 在原版基础上追加: REGOUT0=3.3V + NFCPINS=GPIO | **推荐：一步到位，无需 bootloader 运行时写入** |
+| `nice_nano_bootloader-0.10.0_s140_6.1.1_patched_1v8.hex` | 在原版基础上追加: NFCPINS=GPIO（REGOUT0 保持默认 1.8V） | 省电测试用 |
 
-Patched hex 的优势：`loadfile` 后所有 UICR 配置立即生效，即使 bootloader 因为某种原因没有成功运行，VDD 也已经是 3.3V。
+Patched hex 的优势：`loadfile` 后所有 UICR 配置立即生效，即使 bootloader 因为某种原因没有成功运行，VDD 也已经是正确电压。
+
+### 一体化刷机 Hex（Bootloader + ZMK App + UICR，一次搞定）
+
+适用于空白芯片或全擦后的一步到位刷写，`erase` + `loadfile` 即可获得完整可用的 CyberFly 键盘：
+
+| 文件 | VDD 电压 | 内容 | 适用场景 |
+|------|---------|------|---------|
+| **`cyberfly_zmk_full_3v3.hex`** | **3.3V** | MBR + SoftDevice + ZMK App + Bootloader + NVS + UICR (含 REGOUT0=3.3V, NFCPINS=GPIO) | **推荐：兼容所有 3.3V 外设** |
+| `cyberfly_zmk_full_1v8.hex` | 1.8V | 同上，但 REGOUT0 保持默认 1.8V | 省电测试、无 3.3V 外设的场景 |
+
+```bash
+# 一步刷写完整 CyberFly 键盘 (3.3V 版本)
+JLinkExe -device NRF52840_XXAA -if SWD -speed 4000 -autoconnect 1
+> erase
+> loadfile firmware/cyberfly_zmk_full_3v3.hex
+> r
+> g
+> exit
+# 刷完即用：BLE 键盘 + UF2 bootloader + 所有 UICR 配置，无需额外步骤
+```
+
+> **1.8V vs 3.3V 省电分析**：REG0 DC-DC 将 VDDH (3.0-4.2V) 降到 VDD 时，1.8V 输出的转换效率略高于 3.3V（压差更大，DC-DC 工作在更高效的占空比区间）。但对 BLE 键盘来说，RF 和 CPU 功耗主要由 REG1 核心级 (1.3V) 决定，VDD 电压对总功耗影响约 2-5%。选 1.8V 的前提是所有外设（LED、传感器、OLED）都支持 1.8V I/O 电平。
 
 ### ⚠️ 警告：不要用 loadbin 刷 Flash dump 替代 hex 刷机流程
 
