@@ -188,19 +188,28 @@ Blank nRF52840 (0xFF)
 ### Flashing Commands
 
 ```bash
-# Option A: Use the script (推荐)
-./jlink-scripts/05-flash-hex.sh firmware/bootloader/nice_nano_bootloader-0.10.0_s140_6.1.1.hex
+# Option A: Use the script (推荐，使用 patched hex)
+./jlink-scripts/05-flash-hex.sh firmware/bootloader/nice_nano_bootloader-0.10.0_s140_6.1.1_patched.hex
 
 # Option B: Manual JLinkExe
 JLinkExe -device NRF52840_XXAA -if SWD -speed 4000 -autoconnect 1
 > erase
-> loadfile firmware/bootloader/nice_nano_bootloader-0.10.0_s140_6.1.1.hex
+> loadfile firmware/bootloader/nice_nano_bootloader-0.10.0_s140_6.1.1_patched.hex
 > r
 > g
 > exit
 ```
 
-> **Important**: The `nice_nano_bootloader-0.10.0_s140_6.1.1.hex` file is a **merged hex** that contains MBR + SoftDevice S140 v6.1.1 + Bootloader + **UICR 数据** all in one file. You only need to flash this single file.
+> **Important**: 推荐使用 **patched hex** (`*_patched.hex`)，它在 Adafruit 原版 hex 基础上额外包含了 REGOUT0=3.3V 和 NFCPINS=GPIO 的 UICR 数据。`loadfile` 一步写入所有 UICR 配置，不依赖 bootloader 运行时写入。
+
+### Bootloader Hex 文件说明
+
+| 文件 | 内容 | 推荐 |
+|------|------|------|
+| `nice_nano_bootloader-0.10.0_s140_6.1.1.hex` | Adafruit 原版: MBR + SoftDevice + Bootloader + UICR (bootloader addr + MBR params) | 可用，但 REGOUT0 需要 bootloader 运行时写入 |
+| **`nice_nano_bootloader-0.10.0_s140_6.1.1_patched.hex`** | 在原版基础上追加: REGOUT0=3.3V + NFCPINS=GPIO | **推荐：一步到位，无需 bootloader 运行时写入** |
+
+Patched hex 的优势：`loadfile` 后所有 UICR 配置立即生效，即使 bootloader 因为某种原因没有成功运行，VDD 也已经是 3.3V。
 
 ### ⚠️ 警告：不要用 loadbin 刷 Flash dump 替代 hex 刷机流程
 
@@ -225,13 +234,14 @@ JLinkExe -device NRF52840_XXAA -if SWD -speed 4000 -autoconnect 1
 > **如果已经用 loadbin 刷错了**，补救方法：
 >
 > ```bash
-> # 重新刷一次 bootloader hex（不需要 erase，hex 会覆盖对应区域并写入 UICR）
+> # 重新刷一次 patched bootloader hex（不需要 erase，hex 会覆盖对应区域并写入 UICR）
 > JLinkExe -device NRF52840_XXAA -if SWD -speed 4000 -autoconnect 1
-> > loadfile firmware/bootloader/nice_nano_bootloader-0.10.0_s140_6.1.1.hex
+> > loadfile firmware/bootloader/nice_nano_bootloader-0.10.0_s140_6.1.1_patched.hex
 > > r
 > > g
 > > exit
 > # App 区域 (0x26000-0xF3FFF) 的 ZMK 固件不会被覆盖
+> # UICR 中的 REGOUT0=3.3V、NFCPINS=GPIO 一步写入，无需 bootloader 运行时补写
 > ```
 
 ### UICR 写入时机详解（源码验证）
