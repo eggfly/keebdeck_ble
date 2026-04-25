@@ -2023,6 +2023,35 @@ KeebDeck Mini 用的是 nRF52833，和本项目（keebdeck_ble）使用的 nRF52
 - Each line must be a valid JLink command
 - Use bash `echo` for messages, keep `.jlink` files as pure commands
 
+### NVS 清空后 macOS 蓝牙"已配对但连不上"，附近设备也搜不到
+
+**症状**：刷全 Flash dump、erase 重刷、或 Fn+C 清除 NVS 后，macOS 蓝牙设置里显示 CyberFly 仍在已配对列表中，但点击连接永远失败。同时"附近设备"扫描中看不到这台键盘。
+
+**原因**：
+
+```
+NVS 清空前:
+  Mac 端: 绑定列表有 CyberFly (地址 + LESC 密钥)
+  板子端: NVS 有对应的 bt/keys (地址 + LESC 密钥)
+  → 双方密钥匹配，正常通信
+
+NVS 清空后:
+  Mac 端: 绑定列表仍有 CyberFly (旧密钥还在)
+  板子端: NVS 已清空 (密钥丢失)
+  → Mac 用旧密钥发起加密连接，板子没有对应密钥，握手失败
+  → macOS 扫描到相同 BLE 地址，认为已在绑定列表中，不显示在"附近设备"
+```
+
+**解决方法**：在 macOS 蓝牙设置中删除（忽略/取消配对）对应的 CyberFly 设备，然后重新扫描配对。如果不确定是哪一个，可以把所有 CyberFly 设备都删掉再重新配对。
+
+**触发场景**：
+- `erase` + 重新刷固件（NVS 被擦除）
+- Fn+C 清除 NVS / settings reset
+- JLink 刷全 Flash dump（NVS 被覆盖为无配对状态）
+- 任何导致板子端配对信息丢失的操作
+
+> 此问题不限于 macOS，Windows/Linux/iOS 等所有 BLE 主机都有类似行为：主机端记住了配对密钥，但设备端已经忘记了，导致单向配对不匹配。解决方法相同：删除主机端的绑定记录，重新配对。
+
 ---
 
 ## IMU 传感器 (QMI8658A) DTS 配置
