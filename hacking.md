@@ -2471,19 +2471,35 @@ ZMK 文档明确提到了这个问题，建议受影响的 macOS 用户使用 `C
 
 ## JLink 全 Flash 刷写与 bt/hash 机制
 
-### bt/hash 是什么
+### bt/hash 不依赖硬件 FICR
 
-Zephyr 蓝牙栈在首次启动时，从芯片 FICR 中读取硬件唯一的 BLE 身份地址，计算一个哈希值，写入 NVS 的 `bt/hash` 键。每次后续启动都会重新计算并与 NVS 中存储的值对比。
+实测验证（2026-04-25）：将 Board 2 的全 Flash dump 通过 JLink 刷入 Board 3（两块芯片 Device ID 完全不同），再通过 UF2 刷入相同的 ZMK 固件后 dump 对比：
 
-### 跨芯片刷写时的自动修复
+| | Board 2 | Board 3 |
+|---|---|---|
+| Device ID | 10622682:909A3455 | C288D5B0:74EF4258 |
+| bt/hash | `eaf48cd054bb290470f858381abe01e0` | `eaf48cd054bb290470f858381abe01e0` |
+| 全 Flash MD5 | fa2ec6021fd4cb6939df4b671f300e45 | fa2ec6021fd4cb6939df4b671f300e45 |
 
-如果将 A 芯片的全 Flash dump 通过 JLink 刷入 B 芯片，B 芯片首次启动时会发现：
+**1MB Flash 逐字节完全一致。** `bt/hash` 不是从 FICR Device ID 计算的，而是从 BLE identity（固件中确定性生成的静态随机地址或 IRK）派生的。跨芯片 JLink 克隆后 bt/hash 不变，Zephyr 不会检测到不匹配。
 
-- NVS 中的 `bt/hash` = A 芯片的哈希值
-- 实际计算出的哈希 = B 芯片的哈希值（FICR 不同）
-- **两者不一致 → Zephyr 自动清除所有旧 BLE 配对数据，写入新的 bt/hash**
+### JLink 全 Flash 克隆完全可行
 
-因此 JLink 全 Flash 刷写到不同芯片是安全的，不会导致 BLE 配对错乱，只是旧的配对信息会丢失（需要重新配对）。
+JLink 刷全 Flash dump 到不同芯片可以直接使用，无需担心 bt/hash 不匹配问题。但需注意：**克隆出的板子 BLE 身份相同**（广播相同的地址/名称），同时开机靠近同一主机可能冲突。
+
+### 配对密钥每次不同
+
+两块相同 bt/hash 的板子分别与同一台 Mac 配对后，NVS 中的配对数据对比：
+
+| 字段 | 结果 | 说明 |
+|------|------|------|
+| `bt/hash` | 完全相同 | 不依赖硬件，克隆后一致 |
+| `bt/keys` MAC 部分 | 完全相同 (`c0c7db011b570`) | 同一台 Mac |
+| `bt/keys` LESC 密钥 (16 字节) | **完全不同** | ECDH 密钥交换每次随机协商 |
+| `bt/ccc` | 结构相同 | GATT 通知订阅状态 |
+| `ble/profiles/0` | GATT 句柄相同 | ZMK profile 绑定 |
+
+配对密钥是 BLE LESC (LE Secure Connections) 的 ECDH 密钥交换结果，每次配对过程中随机生成，与硬件 ID 无关。
 
 ### NVS 存储位置
 
